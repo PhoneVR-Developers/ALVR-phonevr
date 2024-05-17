@@ -1,12 +1,13 @@
 use crate::{
-    bindings::FfiButtonValue, connection::CLIENTS_TO_BE_REMOVED, DECODER_CONFIG, FILESYSTEM_LAYOUT,
-    SERVER_DATA_MANAGER, STATISTICS_MANAGER, VIDEO_MIRROR_SENDER, VIDEO_RECORDING_FILE,
+    bindings::FfiButtonValue, connection::CLIENTS_TO_BE_REMOVED, logging_backend::EVENTS_SENDER,
+    ServerCoreEvent, DECODER_CONFIG, EVENTS_QUEUE, FILESYSTEM_LAYOUT, SERVER_DATA_MANAGER,
+    STATISTICS_MANAGER, VIDEO_MIRROR_SENDER, VIDEO_RECORDING_FILE,
 };
 use alvr_common::{
     anyhow::{self, Result},
     error, info, log, warn, ConnectionState,
 };
-use alvr_events::{ButtonEvent, Event, EventType};
+use alvr_events::{ButtonEvent, EventType};
 use alvr_packets::{ButtonValue, ClientListAction, ServerRequest};
 use bytes::Buf;
 use futures::SinkExt;
@@ -17,7 +18,7 @@ use hyper::{
 };
 use serde::de::DeserializeOwned;
 use serde_json as json;
-use std::{net::SocketAddr, thread};
+use std::net::SocketAddr;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio_tungstenite::{tungstenite::protocol, WebSocketStream};
 use tokio_util::codec::{BytesCodec, FramedRead};
@@ -87,10 +88,7 @@ async fn websocket<T: Clone + Send + 'static>(
     }
 }
 
-async fn http_api(
-    request: Request<Body>,
-    events_sender: broadcast::Sender<Event>,
-) -> Result<Response<Body>> {
+async fn http_api(request: Request<Body>) -> Result<Response<Body>> {
     let mut response = match request.uri().path() {
         // New unified requests
         "/api/dashboard-request" => {
@@ -171,14 +169,12 @@ async fn http_api(
                             alvr_events::send_event(EventType::DriversList(list));
                         }
                     }
-                    ServerRequest::RestartSteamvr => {
-                        thread::spawn(crate::restart_driver);
-                    }
-                    ServerRequest::ShutdownSteamvr => {
-                        // This lint is bugged with extern "C"
-                        #[allow(clippy::redundant_closure)]
-                        thread::spawn(|| crate::shutdown_driver());
-                    }
+                    ServerRequest::RestartSteamvr => EVENTS_QUEUE
+                        .lock()
+                        .push_back(ServerCoreEvent::RestartPending),
+                    ServerRequest::ShutdownSteamvr => EVENTS_QUEUE
+                        .lock()
+                        .push_back(ServerCoreEvent::ShutdownPending),
                 }
 
                 reply(StatusCode::OK)?
@@ -187,7 +183,7 @@ async fn http_api(
             }
         }
         "/api/events" => {
-            websocket(request, events_sender, |e| {
+            websocket(request, EVENTS_SENDER.clone(), |e| {
                 protocol::Message::Text(json::to_string(&e).unwrap())
             })
             .await?
@@ -294,28 +290,22 @@ async fn http_api(
     Ok(response)
 }
 
-pub async fn web_server(events_sender: broadcast::Sender<Event>) -> Result<()> {
+pub async fn web_server() -> Result<()> {
     let web_server_port = SERVER_DATA_MANAGER
         .read()
         .settings()
         .connection
         .web_server_port;
 
-    let service = service::make_service_fn(|_| {
-        let events_sender = events_sender.clone();
-        async move {
-            Ok::<_, anyhow::Error>(service::service_fn(move |request| {
-                let events_sender = events_sender.clone();
-                async move {
-                    let res = http_api(request, events_sender).await;
-                    if let Err(e) = &res {
-                        alvr_common::show_e(e);
-                    }
+    let service = service::make_service_fn(|_| async move {
+        Ok::<_, anyhow::Error>(service::service_fn(move |request| async move {
+            let res = http_api(request).await;
+            if let Err(e) = &res {
+                alvr_common::show_e(e);
+            }
 
-                    res
-                }
-            }))
-        }
+            res
+        }))
     });
 
     Ok(hyper::Server::bind(&SocketAddr::new(

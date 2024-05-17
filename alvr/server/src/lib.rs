@@ -3,6 +3,7 @@ mod body_tracking;
 mod c_api;
 mod connection;
 mod face_tracking;
+mod graphics;
 mod hand_gestures;
 mod haptics;
 mod input_mapping;
@@ -26,30 +27,52 @@ mod bindings {
 use bindings::*;
 
 use alvr_common::{
-    error, log,
+    error,
+    glam::Vec2,
     once_cell::sync::Lazy,
     parking_lot::{Mutex, RwLock},
-    ConnectionState, LifecycleState, OptLazy, RelaxedAtomic,
+    ConnectionState, Fov, LifecycleState, OptLazy, Pose, RelaxedAtomic, DEVICE_ID_TO_PATH,
 };
-use alvr_events::EventType;
+use alvr_events::{EventType, HapticsEvent};
 use alvr_filesystem::{self as afs, Layout};
-use alvr_packets::{ClientListAction, DecoderInitializationConfig};
+use alvr_packets::{BatteryInfo, ClientListAction, DecoderInitializationConfig, Haptics};
 use alvr_server_io::ServerDataManager;
 use alvr_session::{CodecType, Settings};
 use bitrate::BitrateManager;
 use statistics::StatisticsManager;
 use std::{
-    collections::HashMap,
+    collections::VecDeque,
     env,
-    ffi::{c_char, CStr, CString},
+    ffi::CString,
     fs::File,
     io::Write,
     ptr,
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use sysinfo::{ProcessRefreshKind, RefreshKind};
 use tokio::{runtime::Runtime, sync::broadcast};
+
+// todo: use this as the network packet
+pub struct ViewsConfig {
+    // transforms relative to the head
+    pub local_view_transforms: [Pose; 2],
+    pub fov: [Fov; 2],
+}
+
+pub enum ServerCoreEvent {
+    ClientConnected,
+    ClientDisconnected,
+    Battery(BatteryInfo),
+    PlayspaceSync(Vec2),
+    ViewsConfig(ViewsConfig),
+    RequestIDR,
+    GameRenderLatencyFeedback(Duration), // only used for SteamVR
+    ShutdownPending,
+    RestartPending,
+}
+
+pub static EVENTS_QUEUE: Mutex<VecDeque<ServerCoreEvent>> = Mutex::new(VecDeque::new());
 
 pub static LIFECYCLE_STATE: RwLock<LifecycleState> = RwLock::new(LifecycleState::StartingUp);
 pub static IS_RESTARTING: RelaxedAtomic = RelaxedAtomic::new(false);
@@ -70,21 +93,6 @@ static BITRATE_MANAGER: Lazy<Mutex<BitrateManager>> =
 
 static VIDEO_MIRROR_SENDER: OptLazy<broadcast::Sender<Vec<u8>>> = alvr_common::lazy_mut_none();
 static VIDEO_RECORDING_FILE: OptLazy<File> = alvr_common::lazy_mut_none();
-
-static FRAME_RENDER_VS_CSO: &[u8] = include_bytes!("../cpp/platform/win32/FrameRenderVS.cso");
-static FRAME_RENDER_PS_CSO: &[u8] = include_bytes!("../cpp/platform/win32/FrameRenderPS.cso");
-static QUAD_SHADER_CSO: &[u8] = include_bytes!("../cpp/platform/win32/QuadVertexShader.cso");
-static COMPRESS_AXIS_ALIGNED_CSO: &[u8] =
-    include_bytes!("../cpp/platform/win32/CompressAxisAlignedPixelShader.cso");
-static COLOR_CORRECTION_CSO: &[u8] =
-    include_bytes!("../cpp/platform/win32/ColorCorrectionPixelShader.cso");
-static RGBTOYUV420_CSO: &[u8] = include_bytes!("../cpp/platform/win32/rgbtoyuv420.cso");
-
-static QUAD_SHADER_COMP_SPV: &[u8] = include_bytes!("../cpp/platform/linux/shader/quad.comp.spv");
-static COLOR_SHADER_COMP_SPV: &[u8] = include_bytes!("../cpp/platform/linux/shader/color.comp.spv");
-static FFR_SHADER_COMP_SPV: &[u8] = include_bytes!("../cpp/platform/linux/shader/ffr.comp.spv");
-static RGBTOYUV420_SHADER_COMP_SPV: &[u8] =
-    include_bytes!("../cpp/platform/linux/shader/rgbtoyuv420.comp.spv");
 
 static DECODER_CONFIG: OptLazy<DecoderInitializationConfig> = alvr_common::lazy_mut_none();
 
@@ -117,70 +125,6 @@ pub fn create_recording_file(settings: &Settings) {
     }
 }
 
-// This call is blocking
-pub extern "C" fn shutdown_driver() {
-    // Invoke connection runtimes shutdown
-    *LIFECYCLE_STATE.write() = LifecycleState::ShuttingDown;
-
-    {
-        let mut data_manager_lock = SERVER_DATA_MANAGER.write();
-
-        let hostnames = data_manager_lock
-            .client_list()
-            .iter()
-            .filter(|&(_, info)| {
-                !matches!(
-                    info.connection_state,
-                    ConnectionState::Disconnected | ConnectionState::Disconnecting { .. }
-                )
-            })
-            .map(|(hostname, _)| hostname.clone())
-            .collect::<Vec<_>>();
-
-        for hostname in hostnames {
-            data_manager_lock.update_client_list(
-                hostname,
-                ClientListAction::SetConnectionState(ConnectionState::Disconnecting),
-            );
-        }
-    }
-
-    if let Some(thread) = CONNECTION_THREAD.write().take() {
-        thread.join().ok();
-    }
-
-    // apply openvr config for the next launch
-    {
-        let mut server_data_lock = SERVER_DATA_MANAGER.write();
-        server_data_lock.session_mut().openvr_config =
-            connection::contruct_openvr_config(server_data_lock.session());
-    }
-
-    if let Some(backup) = SERVER_DATA_MANAGER
-        .write()
-        .session_mut()
-        .drivers_backup
-        .take()
-    {
-        alvr_server_io::driver_registration(&backup.other_paths, true).ok();
-        alvr_server_io::driver_registration(&[backup.alvr_path], false).ok();
-    }
-
-    while SERVER_DATA_MANAGER
-        .read()
-        .client_list()
-        .iter()
-        .any(|(_, info)| info.connection_state != ConnectionState::Disconnected)
-    {
-        thread::sleep(Duration::from_millis(100));
-    }
-
-    #[cfg(target_os = "windows")]
-    WEBSERVER_RUNTIME.lock().take();
-
-    unsafe { ShutdownSteamvr() };
-}
-
 pub fn notify_restart_driver() {
     let mut system = sysinfo::System::new_with_specifics(
         RefreshKind::new().with_processes(ProcessRefreshKind::everything()),
@@ -195,53 +139,6 @@ pub fn notify_restart_driver() {
         alvr_events::send_event(EventType::ServerRequestsSelfRestart);
     } else {
         error!("Cannot restart SteamVR. No dashboard process found on local device.");
-    }
-}
-
-// This call is blocking
-pub fn restart_driver() {
-    IS_RESTARTING.set(true);
-
-    shutdown_driver();
-}
-
-unsafe extern "C" fn log_error(string_ptr: *const c_char) {
-    alvr_common::show_e(CStr::from_ptr(string_ptr).to_string_lossy());
-}
-
-unsafe fn log(level: log::Level, string_ptr: *const c_char) {
-    log::log!(level, "{}", CStr::from_ptr(string_ptr).to_string_lossy());
-}
-
-unsafe extern "C" fn log_warn(string_ptr: *const c_char) {
-    log(log::Level::Warn, string_ptr);
-}
-
-unsafe extern "C" fn log_info(string_ptr: *const c_char) {
-    log(log::Level::Info, string_ptr);
-}
-
-unsafe extern "C" fn log_debug(string_ptr: *const c_char) {
-    log(log::Level::Debug, string_ptr);
-}
-
-// Should not be used in production
-unsafe extern "C" fn log_periodically(tag_ptr: *const c_char, message_ptr: *const c_char) {
-    const INTERVAL: Duration = Duration::from_secs(1);
-    static LASTEST_TAG_TIMESTAMPS: Lazy<Mutex<HashMap<String, Instant>>> =
-        Lazy::new(|| Mutex::new(HashMap::new()));
-
-    let tag = CStr::from_ptr(tag_ptr).to_string_lossy();
-    let message = CStr::from_ptr(message_ptr).to_string_lossy();
-
-    let mut timestamps_ref = LASTEST_TAG_TIMESTAMPS.lock();
-    let old_timestamp = timestamps_ref
-        .entry(tag.to_string())
-        .or_insert_with(Instant::now);
-    if *old_timestamp + INTERVAL < Instant::now() {
-        *old_timestamp += INTERVAL;
-
-        log::warn!("{}: {}", tag, message);
     }
 }
 
@@ -270,29 +167,6 @@ extern "C" fn set_video_config_nals(buffer_ptr: *const u8, len: i32, codec: i32)
         codec,
         config_buffer,
     });
-}
-
-pub extern "C" fn driver_ready_idle(set_default_chap: bool) {
-    // Note: Idle state is not used on the server side
-    *LIFECYCLE_STATE.write() = LifecycleState::Resumed;
-
-    thread::spawn(move || {
-        if set_default_chap {
-            // call this when inside a new thread. Calling this on the parent thread will crash
-            // SteamVR
-            unsafe {
-                InitOpenvrClient();
-                SetChaperoneArea(2.0, 2.0);
-                ShutdownOpenvrClient();
-            }
-        }
-
-        connection::handshake_loop();
-    });
-}
-
-unsafe extern "C" fn path_string_to_hash(path: *const c_char) -> u64 {
-    alvr_common::hash_string(CStr::from_ptr(path).to_str().unwrap())
 }
 
 extern "C" fn report_present(timestamp_ns: u64, offset_ns: u64) {
@@ -335,100 +209,180 @@ extern "C" fn get_dynamic_encoder_params() -> FfiDynamicEncoderParams {
     params
 }
 
-extern "C" fn wait_for_vsync() {
-    if SERVER_DATA_MANAGER
-        .read()
-        .settings()
-        .video
-        .optimize_game_render_latency
-    {
-        // Note: unlock STATISTICS_MANAGER as soon as possible
-        let wait_duration = STATISTICS_MANAGER
+struct ServerCoreContext {}
+
+impl ServerCoreContext {
+    fn new() -> Self {
+        if SERVER_DATA_MANAGER
+            .read()
+            .settings()
+            .extra
+            .logging
+            .prefer_backtrace
+        {
+            env::set_var("RUST_BACKTRACE", "1");
+        }
+
+        SERVER_DATA_MANAGER.write().clean_client_list();
+
+        if let Some(runtime) = WEBSERVER_RUNTIME.lock().as_mut() {
+            runtime.spawn(async { alvr_common::show_err(web_server::web_server().await) });
+        }
+
+        unsafe {
+            g_sessionPath = CString::new(FILESYSTEM_LAYOUT.session().to_string_lossy().to_string())
+                .unwrap()
+                .into_raw();
+            g_driverRootDir = CString::new(
+                FILESYSTEM_LAYOUT
+                    .openvr_driver_root_dir
+                    .to_string_lossy()
+                    .to_string(),
+            )
+            .unwrap()
+            .into_raw();
+        };
+
+        graphics::initialize_shaders();
+
+        unsafe {
+            LogError = Some(c_api::alvr_log_error);
+            LogWarn = Some(c_api::alvr_log_warn);
+            LogInfo = Some(c_api::alvr_log_info);
+            LogDebug = Some(c_api::alvr_log_debug);
+            LogPeriodically = Some(c_api::alvr_log_periodically);
+            SetVideoConfigNals = Some(set_video_config_nals);
+            VideoSend = Some(connection::send_video);
+            PathStringToHash = Some(c_api::alvr_path_to_id);
+            ReportPresent = Some(report_present);
+            ReportComposed = Some(report_composed);
+            GetDynamicEncoderParams = Some(get_dynamic_encoder_params);
+
+            CppInit();
+        }
+
+        Self {}
+    }
+
+    fn start_connection(&self) {
+        // Note: Idle state is not used on the server side
+        *LIFECYCLE_STATE.write() = LifecycleState::Resumed;
+
+        thread::spawn(move || {
+            connection::handshake_loop();
+        });
+    }
+
+    fn poll_event(&self) -> Option<ServerCoreEvent> {
+        EVENTS_QUEUE.lock().pop_front()
+    }
+
+    fn send_haptics(&self, haptics: Haptics) {
+        let haptics_config = {
+            let data_manager_lock = SERVER_DATA_MANAGER.read();
+
+            if data_manager_lock.settings().extra.logging.log_haptics {
+                alvr_events::send_event(EventType::Haptics(HapticsEvent {
+                    path: DEVICE_ID_TO_PATH
+                        .get(&haptics.device_id)
+                        .map(|p| (*p).to_owned())
+                        .unwrap_or_else(|| format!("Unknown (ID: {:#16x})", haptics.device_id)),
+                    duration: haptics.duration,
+                    frequency: haptics.frequency,
+                    amplitude: haptics.amplitude,
+                }))
+            }
+
+            data_manager_lock
+                .settings()
+                .headset
+                .controllers
+                .as_option()
+                .and_then(|c| c.haptics.as_option().cloned())
+        };
+
+        if let (Some(config), Some(sender)) =
+            (haptics_config, &mut *connection::HAPTICS_SENDER.lock())
+        {
+            sender
+                .send_header(&haptics::map_haptics(&config, haptics))
+                .ok();
+        }
+    }
+
+    fn duration_until_next_vsync(&self) -> Option<Duration> {
+        STATISTICS_MANAGER
             .lock()
             .as_mut()
-            .map(|stats| stats.duration_until_next_vsync());
+            .map(|stats| stats.duration_until_next_vsync())
+    }
 
-        if let Some(duration) = wait_duration {
-            thread::sleep(duration);
-        }
+    fn restart(self) {
+        IS_RESTARTING.set(true);
+
+        // drop is called here for self
     }
 }
 
-fn init() {
-    let (events_sender, _) = broadcast::channel(web_server::WS_BROADCAST_CAPACITY);
-    logging_backend::init_logging(events_sender.clone());
+impl Drop for ServerCoreContext {
+    fn drop(&mut self) {
+        // Invoke connection runtimes shutdown
+        *LIFECYCLE_STATE.write() = LifecycleState::ShuttingDown;
 
-    if SERVER_DATA_MANAGER
-        .read()
-        .settings()
-        .extra
-        .logging
-        .prefer_backtrace
-    {
-        env::set_var("RUST_BACKTRACE", "1");
-    }
+        {
+            let mut data_manager_lock = SERVER_DATA_MANAGER.write();
 
-    SERVER_DATA_MANAGER.write().clean_client_list();
+            let hostnames = data_manager_lock
+                .client_list()
+                .iter()
+                .filter(|&(_, info)| {
+                    !matches!(
+                        info.connection_state,
+                        ConnectionState::Disconnected | ConnectionState::Disconnecting { .. }
+                    )
+                })
+                .map(|(hostname, _)| hostname.clone())
+                .collect::<Vec<_>>();
 
-    if let Some(runtime) = WEBSERVER_RUNTIME.lock().as_mut() {
-        runtime.spawn(async { alvr_common::show_err(web_server::web_server(events_sender).await) });
-    }
+            for hostname in hostnames {
+                data_manager_lock.update_client_list(
+                    hostname,
+                    ClientListAction::SetConnectionState(ConnectionState::Disconnecting),
+                );
+            }
+        }
 
-    unsafe {
-        g_sessionPath = CString::new(FILESYSTEM_LAYOUT.session().to_string_lossy().to_string())
-            .unwrap()
-            .into_raw();
-        g_driverRootDir = CString::new(
-            FILESYSTEM_LAYOUT
-                .openvr_driver_root_dir
-                .to_string_lossy()
-                .to_string(),
-        )
-        .unwrap()
-        .into_raw();
-    };
+        if let Some(thread) = CONNECTION_THREAD.write().take() {
+            thread.join().ok();
+        }
 
-    unsafe {
-        FRAME_RENDER_VS_CSO_PTR = FRAME_RENDER_VS_CSO.as_ptr();
-        FRAME_RENDER_VS_CSO_LEN = FRAME_RENDER_VS_CSO.len() as _;
-        FRAME_RENDER_PS_CSO_PTR = FRAME_RENDER_PS_CSO.as_ptr();
-        FRAME_RENDER_PS_CSO_LEN = FRAME_RENDER_PS_CSO.len() as _;
-        QUAD_SHADER_CSO_PTR = QUAD_SHADER_CSO.as_ptr();
-        QUAD_SHADER_CSO_LEN = QUAD_SHADER_CSO.len() as _;
-        COMPRESS_AXIS_ALIGNED_CSO_PTR = COMPRESS_AXIS_ALIGNED_CSO.as_ptr();
-        COMPRESS_AXIS_ALIGNED_CSO_LEN = COMPRESS_AXIS_ALIGNED_CSO.len() as _;
-        COLOR_CORRECTION_CSO_PTR = COLOR_CORRECTION_CSO.as_ptr();
-        COLOR_CORRECTION_CSO_LEN = COLOR_CORRECTION_CSO.len() as _;
-        RGBTOYUV420_CSO_PTR = RGBTOYUV420_CSO.as_ptr();
-        RGBTOYUV420_CSO_LEN = RGBTOYUV420_CSO.len() as _;
-        QUAD_SHADER_COMP_SPV_PTR = QUAD_SHADER_COMP_SPV.as_ptr();
-        QUAD_SHADER_COMP_SPV_LEN = QUAD_SHADER_COMP_SPV.len() as _;
-        COLOR_SHADER_COMP_SPV_PTR = COLOR_SHADER_COMP_SPV.as_ptr();
-        COLOR_SHADER_COMP_SPV_LEN = COLOR_SHADER_COMP_SPV.len() as _;
-        FFR_SHADER_COMP_SPV_PTR = FFR_SHADER_COMP_SPV.as_ptr();
-        FFR_SHADER_COMP_SPV_LEN = FFR_SHADER_COMP_SPV.len() as _;
-        RGBTOYUV420_SHADER_COMP_SPV_PTR = RGBTOYUV420_SHADER_COMP_SPV.as_ptr();
-        RGBTOYUV420_SHADER_COMP_SPV_LEN = RGBTOYUV420_SHADER_COMP_SPV.len() as _;
+        // apply openvr config for the next launch
+        {
+            let mut server_data_lock = SERVER_DATA_MANAGER.write();
+            server_data_lock.session_mut().openvr_config =
+                connection::contruct_openvr_config(server_data_lock.session());
+        }
 
-        LogError = Some(log_error);
-        LogWarn = Some(log_warn);
-        LogInfo = Some(log_info);
-        LogDebug = Some(log_debug);
-        LogPeriodically = Some(log_periodically);
-        DriverReadyIdle = Some(driver_ready_idle);
-        SetVideoConfigNals = Some(set_video_config_nals);
-        VideoSend = Some(connection::send_video);
-        HapticsSend = Some(connection::send_haptics);
-        ShutdownRuntime = Some(shutdown_driver);
-        PathStringToHash = Some(path_string_to_hash);
-        ReportPresent = Some(report_present);
-        ReportComposed = Some(report_composed);
-        GetSerialNumber = Some(openvr::get_serial_number);
-        SetOpenvrProps = Some(openvr::set_device_openvr_props);
-        RegisterButtons = Some(input_mapping::register_buttons);
-        GetDynamicEncoderParams = Some(get_dynamic_encoder_params);
-        WaitForVSync = Some(wait_for_vsync);
+        if let Some(backup) = SERVER_DATA_MANAGER
+            .write()
+            .session_mut()
+            .drivers_backup
+            .take()
+        {
+            alvr_server_io::driver_registration(&backup.other_paths, true).ok();
+            alvr_server_io::driver_registration(&[backup.alvr_path], false).ok();
+        }
 
-        CppInit();
+        while SERVER_DATA_MANAGER
+            .read()
+            .client_list()
+            .iter()
+            .any(|(_, info)| info.connection_state != ConnectionState::Disconnected)
+        {
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        #[cfg(target_os = "windows")]
+        WEBSERVER_RUNTIME.lock().take();
     }
 }
