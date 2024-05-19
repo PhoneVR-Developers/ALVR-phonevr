@@ -1,15 +1,23 @@
 #![allow(dead_code, unused_variables)]
 
-use crate::{logging_backend, ServerCoreContext, ServerCoreEvent};
-use alvr_common::{log, once_cell::sync::Lazy, parking_lot::Mutex, Fov, OptLazy, Pose};
+use crate::{logging_backend, ServerCoreContext, ServerCoreEvent, SERVER_DATA_MANAGER};
+use alvr_common::{
+    log,
+    once_cell::sync::Lazy,
+    parking_lot::{Mutex, RwLock},
+    Fov, Pose,
+};
 use alvr_packets::Haptics;
+use alvr_session::CodecType;
 use std::{
     collections::HashMap,
-    ffi::{c_char, CStr},
+    ffi::{c_char, CStr, CString},
+    ptr,
     time::{Duration, Instant},
 };
 
-static SERVER_CORE_CONTEXT: OptLazy<ServerCoreContext> = alvr_common::lazy_mut_none();
+static SERVER_CORE_CONTEXT: Lazy<RwLock<Option<ServerCoreContext>>> =
+    Lazy::new(|| RwLock::new(None));
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -32,6 +40,7 @@ pub struct AlvrQuat {
     pub z: f32,
     pub w: f32,
 }
+
 impl Default for AlvrQuat {
     fn default() -> Self {
         Self {
@@ -41,6 +50,13 @@ impl Default for AlvrQuat {
             w: 1.0,
         }
     }
+}
+
+#[repr(u8)]
+pub enum AlvrCodecType {
+    H264 = 0,
+    Hevc = 1,
+    AV1 = 2,
 }
 
 #[repr(C)]
@@ -98,7 +114,7 @@ pub struct AlvrBatteryInfo {
     pub is_plugged: bool,
 }
 
-#[repr(C)]
+#[repr(u8)]
 pub enum AlvrEvent {
     ClientConnected,
     ClientDisconnected,
@@ -116,8 +132,10 @@ pub enum AlvrEvent {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct AlvrTargetConfig {
-    target_width: u32,
-    target_height: u32,
+    game_render_width: u32,
+    game_render_height: u32,
+    stream_width: u32,
+    stream_height: u32,
 }
 
 #[repr(C)]
@@ -125,6 +143,12 @@ pub struct AlvrTargetConfig {
 pub struct AlvrDeviceConfig {
     device_id: u64,
     interaction_profile_id: u64,
+}
+
+#[repr(C)]
+pub struct AlvrDynamicEncoderParams {
+    bitrate_bps: u64,
+    framerate: f32,
 }
 
 fn pose_to_capi(pose: &Pose) -> AlvrPose {
@@ -146,6 +170,17 @@ fn fov_to_capi(fov: &Fov) -> AlvrFov {
         up: fov.up,
         down: fov.down,
     }
+}
+
+fn string_to_c_str(buffer: *mut c_char, value: &str) -> u64 {
+    let cstring = CString::new(value).unwrap();
+    if !buffer.is_null() {
+        unsafe {
+            ptr::copy_nonoverlapping(cstring.as_ptr(), buffer, cstring.as_bytes_with_nul().len());
+        }
+    }
+
+    cstring.as_bytes_with_nul().len() as u64
 }
 
 // Get ALVR server time. The libalvr user should provide timestamps in the provided time frame of
@@ -208,25 +243,43 @@ pub unsafe extern "C" fn alvr_log_periodically(tag_ptr: *const c_char, message_p
 }
 
 #[no_mangle]
+pub extern "C" fn alvr_get_settings_json(buffer: *mut c_char) -> u64 {
+    string_to_c_str(
+        buffer,
+        &serde_json::to_string(&SERVER_DATA_MANAGER.read().settings()).unwrap(),
+    )
+}
+
+#[no_mangle]
 pub extern "C" fn alvr_initialize_logging() {
     logging_backend::init_logging();
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn alvr_initialize(out_target_config: *mut AlvrTargetConfig) {
-    *SERVER_CORE_CONTEXT.lock() = Some(ServerCoreContext::new());
+pub unsafe extern "C" fn alvr_initialize() -> AlvrTargetConfig {
+    *SERVER_CORE_CONTEXT.write() = Some(ServerCoreContext::new());
+
+    let data_manager_lock = SERVER_DATA_MANAGER.read();
+    let restart_settings = &data_manager_lock.session().openvr_config;
+
+    AlvrTargetConfig {
+        game_render_width: restart_settings.target_eye_resolution_width,
+        game_render_height: restart_settings.target_eye_resolution_height,
+        stream_width: restart_settings.eye_resolution_width,
+        stream_height: restart_settings.eye_resolution_height,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn alvr_start_connection() {
-    if let Some(context) = &*SERVER_CORE_CONTEXT.lock() {
+    if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
         context.start_connection();
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn alvr_poll_event(out_event: *mut AlvrEvent) -> bool {
-    if let Some(context) = &*SERVER_CORE_CONTEXT.lock() {
+    if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
         if let Some(event) = context.poll_event() {
             match event {
                 ServerCoreEvent::ClientConnected => {
@@ -273,10 +326,100 @@ pub unsafe extern "C" fn alvr_poll_event(out_event: *mut AlvrEvent) -> bool {
     }
 }
 
+#[no_mangle]
+pub extern "C" fn alvr_send_haptics(
+    device_id: u64,
+    duration_s: f32,
+    frequency: f32,
+    amplitude: f32,
+) {
+    if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
+        context.send_haptics(Haptics {
+            device_id,
+            duration: Duration::from_secs_f32(f32::max(duration_s, 0.0)),
+            frequency,
+            amplitude,
+        });
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn alvr_set_video_config_nals(
+    codec: AlvrCodecType,
+    buffer_ptr: *const u8,
+    len: i32,
+) {
+    let codec = match codec {
+        AlvrCodecType::H264 => CodecType::H264,
+        AlvrCodecType::Hevc => CodecType::Hevc,
+        AlvrCodecType::AV1 => CodecType::AV1,
+    };
+
+    let mut config_buffer = vec![0; len as usize];
+
+    unsafe { ptr::copy_nonoverlapping(buffer_ptr, config_buffer.as_mut_ptr(), len as usize) };
+
+    if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
+        context.set_video_config_nals(config_buffer, codec);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn alvr_send_video_nal(
+    timestamp_ns: u64,
+    buffer_ptr: *mut u8,
+    len: i32,
+    is_idr: bool,
+) {
+    if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
+        let buffer = unsafe { std::slice::from_raw_parts(buffer_ptr, len as usize) };
+        context.send_video_nal(Duration::from_nanos(timestamp_ns), buffer.to_vec(), is_idr);
+    }
+}
+
+// Returns true if updated
+#[no_mangle]
+pub unsafe extern "C" fn alvr_get_dynamic_encoder_params(
+    out_params: *mut AlvrDynamicEncoderParams,
+) -> bool {
+    if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
+        if let Some(params) = context.get_dynamic_encoder_params() {
+            (*out_params).bitrate_bps = params.bitrate_bps;
+            (*out_params).framerate = params.framerate;
+
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn alvr_report_composed(timestamp_ns: u64, offset_ns: u64) {
+    if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
+        context.report_composed(
+            Duration::from_nanos(timestamp_ns),
+            Duration::from_nanos(offset_ns),
+        );
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn alvr_report_present(timestamp_ns: u64, offset_ns: u64) {
+    if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
+        context.report_present(
+            Duration::from_nanos(timestamp_ns),
+            Duration::from_nanos(offset_ns),
+        );
+    }
+}
+
 /// Retrun true if a valid value is provided
 #[no_mangle]
 pub extern "C" fn alvr_duration_until_next_vsync(out_ns: *mut u64) -> bool {
-    if let Some(context) = &*SERVER_CORE_CONTEXT.lock() {
+    if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
         if let Some(duration) = context.duration_until_next_vsync() {
             unsafe { *out_ns = duration.as_nanos() as u64 };
             true
@@ -289,32 +432,15 @@ pub extern "C" fn alvr_duration_until_next_vsync(out_ns: *mut u64) -> bool {
 }
 
 #[no_mangle]
-pub extern "C" fn alvr_send_haptics(
-    device_id: u64,
-    duration_s: f32,
-    frequency: f32,
-    amplitude: f32,
-) {
-    if let Some(context) = &*SERVER_CORE_CONTEXT.lock() {
-        context.send_haptics(Haptics {
-            device_id,
-            duration: Duration::from_secs_f32(f32::max(duration_s, 0.0)),
-            frequency,
-            amplitude,
-        });
-    }
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn alvr_restart() {
-    if let Some(context) = SERVER_CORE_CONTEXT.lock().take() {
+    if let Some(context) = SERVER_CORE_CONTEXT.write().take() {
         context.restart();
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn alvr_shutdown() {
-    SERVER_CORE_CONTEXT.lock().take();
+    SERVER_CORE_CONTEXT.write().take();
 }
 
 // // Device API:
