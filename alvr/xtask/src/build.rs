@@ -182,6 +182,13 @@ pub fn build_streamer(
 
     // copy dependencies
     if cfg!(windows) {
+        sh.copy_file(
+            &afs::workspace_dir().join("openvr/bin/win64/openvr_api.dll"),
+            &build_layout.openvr_driver_lib_dir(),
+        )
+        .unwrap();
+
+        // Bring along the c++ runtime
         command::copy_recursive(
             &sh,
             &afs::crate_dir("server").join("cpp/bin/windows"),
@@ -235,6 +242,12 @@ pub fn build_streamer(
         sh.copy_file(
             afs::crate_dir("vulkan_layer").join("layer/alvr_x86_64.json"),
             build_layout.vulkan_layer_manifest(),
+        )
+        .unwrap();
+
+        sh.copy_file(
+            &afs::workspace_dir().join("openvr/bin/linux64/libopenvr_api.so"),
+            &build_layout.openvr_driver_lib_dir(),
         )
         .unwrap();
 
@@ -372,7 +385,13 @@ pub fn build_android_client(profile: Profile) {
     sh.create_dir(&build_dir).unwrap();
 
     // Create debug keystore (signing will be overwritten by CI)
-    if matches!(profile, Profile::Release | Profile::Distribution) {
+    if env::var(format!(
+        "CARGO_APK_{}_KEYSTORE",
+        profile.to_string().to_uppercase()
+    ))
+    .is_err()
+        && matches!(profile, Profile::Release | Profile::Distribution)
+    {
         let keystore_path = build_dir.join("debug.keystore");
         if !keystore_path.exists() {
             let keytool = PathBuf::from(env::var("JAVA_HOME").unwrap())

@@ -3,6 +3,14 @@ use alvr_filesystem as afs;
 use std::{fs, path::Path};
 use xshell::{cmd, Shell};
 
+pub fn update_submodules(sh: &Shell) {
+    let dir = sh.push_dir(afs::workspace_dir());
+    cmd!(sh, "git submodule update --init --recursive")
+        .run()
+        .unwrap();
+    std::mem::drop(dir);
+}
+
 pub fn choco_install(sh: &Shell, packages: &[&str]) -> Result<(), xshell::Error> {
     cmd!(
         sh,
@@ -71,6 +79,8 @@ pub fn prepare_ffmpeg_windows(deps_path: &Path) {
 pub fn prepare_windows_deps(skip_admin_priv: bool) {
     let sh = Shell::new().unwrap();
 
+    update_submodules(&sh);
+
     let deps_path = afs::deps_dir().join("windows");
     sh.remove_path(&deps_path).ok();
     sh.create_dir(&deps_path).unwrap();
@@ -96,6 +106,8 @@ pub fn prepare_windows_deps(skip_admin_priv: bool) {
 
 pub fn prepare_linux_deps(nvenc_flag: bool) {
     let sh = Shell::new().unwrap();
+
+    update_submodules(&sh);
 
     let deps_path = afs::deps_dir().join("linux");
     sh.remove_path(&deps_path).ok();
@@ -275,6 +287,12 @@ pub fn build_ffmpeg_linux(nvenc_flag: bool, deps_path: &Path) {
     cmd!(sh, "make install").run().unwrap();
 }
 
+pub fn prepare_macos_deps() {
+    let sh = Shell::new().unwrap();
+
+    update_submodules(&sh);
+}
+
 fn get_android_openxr_loaders() {
     fn get_openxr_loader(name: &str, url: &str, source_dir: &str) {
         let sh = Shell::new().unwrap();
@@ -287,14 +305,14 @@ fn get_android_openxr_loaders() {
         command::download_and_extract_zip(url, &temp_dir).unwrap();
         fs::copy(
             temp_dir.join(source_dir).join("libopenxr_loader.so"),
-            destination_dir.join(format!("libopenxr_loader_{name}.so")),
+            destination_dir.join(format!("libopenxr_loader{name}.so")),
         )
         .unwrap();
         fs::remove_dir_all(&temp_dir).ok();
     }
 
     get_openxr_loader(
-        "generic",
+        "",
         &format!(
             "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/{}",
             "release-1.0.27/openxr_loader_for_android-1.0.27.aar",
@@ -303,25 +321,25 @@ fn get_android_openxr_loaders() {
     );
 
     get_openxr_loader(
-        "quest",
+        "_quest",
         "https://securecdn.oculus.com/binaries/download/?id=7092833820755144", // version 60
         "OpenXR/Libs/Android/arm64-v8a/Release",
     );
 
     get_openxr_loader(
-        "pico",
+        "_pico",
         "https://sdk.picovr.com/developer-platform/sdk/PICO_OpenXR_SDK_220.zip",
         "libs/android.arm64-v8a",
     );
 
     get_openxr_loader(
-        "yvr",
+        "_yvr",
         "https://developer.yvrdream.com/yvrdoc/sdk/openxr/yvr_openxr_mobile_sdk_1.0.0.zip",
         "yvr_openxr_mobile_sdk_1.0.0/OpenXR/Libs/Android/arm64-v8a",
     );
 
     get_openxr_loader(
-        "lynx",
+        "_lynx",
         "https://portal.lynx-r.com/downloads/download/16", // version 1.0.0
         "jni/arm64-v8a",
     );
@@ -329,6 +347,8 @@ fn get_android_openxr_loaders() {
 
 pub fn build_android_deps(skip_admin_priv: bool) {
     let sh = Shell::new().unwrap();
+
+    update_submodules(&sh);
 
     if cfg!(windows) && !skip_admin_priv {
         choco_install(&sh, &["unzip", "llvm"]).unwrap();
@@ -346,9 +366,13 @@ pub fn build_android_deps(skip_admin_priv: bool) {
     cmd!(sh, "rustup target add i686-linux-android")
         .run()
         .unwrap();
-    cmd!(sh, "cargo install cargo-apk cargo-ndk cbindgen")
-        .run()
-        .unwrap();
+    cmd!(sh, "cargo install cargo-ndk cbindgen").run().unwrap();
+    cmd!(
+        sh,
+        "cargo install --git https://github.com/zarik5/cargo-apk cargo-apk"
+    )
+    .run()
+    .unwrap();
 
     get_android_openxr_loaders();
 }
