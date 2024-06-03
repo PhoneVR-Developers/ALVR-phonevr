@@ -1,10 +1,11 @@
 use crate::{
     graphics::{self, CompositionLayerBuilder},
-    interaction,
+    interaction, XrContext,
 };
-use alvr_client_core::opengl::RenderViewInput;
+use alvr_client_core::graphics::{GraphicsContext, LobbyRenderer, RenderViewInput};
 use alvr_common::glam::UVec2;
 use openxr as xr;
+use std::rc::Rc;
 
 // todo: add interaction?
 pub struct Lobby {
@@ -12,19 +13,35 @@ pub struct Lobby {
     reference_space: xr::Space,
     swapchains: [xr::Swapchain<xr::OpenGlEs>; 2],
     view_resolution: UVec2,
+    reference_space_type: xr::ReferenceSpaceType,
+    renderer: LobbyRenderer,
 }
 
 impl Lobby {
-    pub fn new(xr_session: xr::Session<xr::OpenGlEs>, view_resolution: UVec2) -> Self {
+    pub fn new(
+        xr_ctx: &XrContext,
+        gfx_ctx: Rc<GraphicsContext>,
+        view_resolution: UVec2,
+        initial_hud_message: &str,
+    ) -> Self {
+        let reference_space_type = if xr_ctx.instance.exts().ext_local_floor.is_some() {
+            xr::ReferenceSpaceType::LOCAL_FLOOR_EXT
+        } else {
+            // The Quest 1 doesn't support LOCAL_FLOOR_EXT, recentering is required for AppLab, but
+            // the Quest 1 is excluded from AppLab anyway.
+            xr::ReferenceSpaceType::STAGE
+        };
+
         let reference_space =
-            interaction::get_reference_space(&xr_session, xr::ReferenceSpaceType::LOCAL_FLOOR_EXT);
+            interaction::get_reference_space(&xr_ctx.session, reference_space_type);
 
         let swapchains = [
-            graphics::create_swapchain(&xr_session, view_resolution, None, false),
-            graphics::create_swapchain(&xr_session, view_resolution, None, false),
+            graphics::create_swapchain(&xr_ctx.session, view_resolution, None, false),
+            graphics::create_swapchain(&xr_ctx.session, view_resolution, None, false),
         ];
 
-        alvr_client_core::opengl::initialize_lobby(
+        let renderer = LobbyRenderer::new(
+            gfx_ctx,
             view_resolution,
             [
                 swapchains[0]
@@ -41,21 +58,26 @@ impl Lobby {
                     .collect(),
             ],
             false, // TODO: correct lobby sRGB for some headsets
+            initial_hud_message,
         );
 
         Self {
-            xr_session,
+            xr_session: xr_ctx.session.clone(),
             reference_space,
             swapchains,
             view_resolution,
+            reference_space_type,
+            renderer,
         }
     }
 
     pub fn update_reference_space(&mut self) {
-        self.reference_space = interaction::get_reference_space(
-            &self.xr_session,
-            xr::ReferenceSpaceType::LOCAL_FLOOR_EXT,
-        );
+        self.reference_space =
+            interaction::get_reference_space(&self.xr_session, self.reference_space_type);
+    }
+
+    pub fn update_hud_message(&mut self, message: &str) {
+        self.renderer.update_hud_message(message);
     }
 
     pub fn render(&mut self, predicted_display_time: xr::Time) -> CompositionLayerBuilder {
@@ -84,7 +106,7 @@ impl Lobby {
             .wait_image(xr::Duration::INFINITE)
             .unwrap();
 
-        alvr_client_core::opengl::render_lobby([
+        self.renderer.render([
             RenderViewInput {
                 pose: crate::from_xr_pose(views[0].pose),
                 fov: crate::from_xr_fov(views[0].fov),

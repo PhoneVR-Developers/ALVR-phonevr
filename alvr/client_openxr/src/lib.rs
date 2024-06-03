@@ -5,7 +5,9 @@ mod lobby;
 mod stream;
 
 use crate::stream::StreamConfig;
-use alvr_client_core::{ClientCapabilities, ClientCoreContext, ClientCoreEvent, Platform};
+use alvr_client_core::{
+    graphics::GraphicsContext, ClientCapabilities, ClientCoreContext, ClientCoreEvent, Platform,
+};
 use alvr_common::{
     error,
     glam::{Quat, UVec2, Vec3},
@@ -15,6 +17,7 @@ use lobby::Lobby;
 use openxr as xr;
 use std::{
     path::Path,
+    rc::Rc,
     sync::Arc,
     thread,
     time::{Duration, Instant},
@@ -144,6 +147,7 @@ pub fn entry_point() {
     exts.bd_controller_interaction = available_extensions.bd_controller_interaction;
     exts.ext_eye_gaze_interaction = available_extensions.ext_eye_gaze_interaction;
     exts.ext_hand_tracking = available_extensions.ext_hand_tracking;
+    exts.ext_local_floor = available_extensions.ext_local_floor;
     exts.fb_color_space = available_extensions.fb_color_space;
     exts.fb_display_refresh_rate = available_extensions.fb_display_refresh_rate;
     exts.fb_eye_tracking_social = available_extensions.fb_eye_tracking_social;
@@ -176,7 +180,7 @@ pub fn entry_point() {
         )
         .unwrap();
 
-    let egl_context = graphics::init_egl();
+    let graphics_context = Rc::new(GraphicsContext::new());
 
     let mut last_lobby_message = String::new();
     let mut stream_config = None::<StreamConfig>;
@@ -193,7 +197,7 @@ pub fn entry_point() {
 
         let (xr_session, mut xr_frame_waiter, mut xr_frame_stream) = unsafe {
             xr_instance
-                .create_session(xr_system, &egl_context.session_create_info())
+                .create_session(xr_system, &graphics::session_create_info(&graphics_context))
                 .unwrap()
         };
 
@@ -237,9 +241,6 @@ pub fn entry_point() {
         };
         let core_context = Arc::new(ClientCoreContext::new(capabilities));
 
-        alvr_client_core::opengl::initialize();
-        alvr_client_core::opengl::update_hud_message(&last_lobby_message);
-
         let interaction_context = Arc::new(interaction::initialize_interaction(
             &xr_context,
             platform,
@@ -251,7 +252,12 @@ pub fn entry_point() {
                 .and_then(|c| c.body_sources_config.clone()),
         ));
 
-        let mut lobby = Lobby::new(xr_session.clone(), default_view_resolution);
+        let mut lobby = Lobby::new(
+            &xr_context,
+            Rc::clone(&graphics_context),
+            default_view_resolution,
+            &last_lobby_message,
+        );
         let mut session_running = false;
         let mut stream_context = None::<StreamContext>;
 
@@ -324,7 +330,7 @@ pub fn entry_point() {
                 match event {
                     ClientCoreEvent::UpdateHudMessage(message) => {
                         last_lobby_message.clone_from(&message);
-                        alvr_client_core::opengl::update_hud_message(&message);
+                        lobby.update_hud_message(&message);
                     }
                     ClientCoreEvent::StreamingStarted {
                         settings,
@@ -350,6 +356,7 @@ pub fn entry_point() {
                         stream_context = Some(StreamContext::new(
                             Arc::clone(&core_context),
                             xr_context.clone(),
+                            Rc::clone(&graphics_context),
                             Arc::clone(&interaction_context),
                             platform,
                             &new_config,
@@ -460,10 +467,9 @@ pub fn entry_point() {
                     .unwrap();
             }
         }
-
-        alvr_client_core::opengl::pause();
-        alvr_client_core::opengl::destroy();
     }
+
+    // grapics_context is dropped here
 }
 
 #[allow(unused)]

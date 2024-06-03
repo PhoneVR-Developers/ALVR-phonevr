@@ -1,5 +1,5 @@
 use crate::{
-    opengl::{self, RenderViewInput},
+    graphics::{GraphicsContext, LobbyRenderer, RenderViewInput, StreamRenderer},
     storage, ClientCapabilities, ClientCoreContext, ClientCoreEvent,
 };
 use alvr_common::{
@@ -13,9 +13,12 @@ use alvr_common::{
 use alvr_packets::{ButtonEntry, ButtonValue, FaceData, ViewParams};
 use alvr_session::{CodecType, FoveatedEncodingConfig};
 use std::{
+    cell::RefCell,
     collections::VecDeque,
     ffi::{c_char, c_void, CStr, CString},
-    ptr, slice,
+    ptr,
+    rc::Rc,
+    slice,
     time::{Duration, Instant},
 };
 
@@ -665,6 +668,12 @@ pub unsafe extern "C" fn alvr_get_frame(
 
 // OpenGL-related interface
 
+thread_local! {
+    static GRAPHICS_CONTEXT: RefCell<Option<Rc<GraphicsContext>>> = const { RefCell::new(None) };
+    static LOBBY_RENDERER: RefCell<Option<LobbyRenderer>> = const { RefCell::new(None) };
+    static STREAM_RENDERER: RefCell<Option<StreamRenderer>> = const { RefCell::new(None) };
+}
+
 #[repr(C)]
 pub struct AlvrViewInput {
     pose: AlvrPose,
@@ -689,12 +698,12 @@ pub struct AlvrStreamConfig {
 
 #[no_mangle]
 pub extern "C" fn alvr_initialize_opengl() {
-    opengl::initialize();
+    GRAPHICS_CONTEXT.set(Some(Rc::new(GraphicsContext::new())));
 }
 
 #[no_mangle]
 pub extern "C" fn alvr_destroy_opengl() {
-    opengl::destroy();
+    GRAPHICS_CONTEXT.set(None);
 }
 
 unsafe fn convert_swapchain_array(
@@ -726,21 +735,28 @@ pub unsafe extern "C" fn alvr_resume_opengl(
     swapchain_length: u32,
     enable_srgb_correction: bool,
 ) {
-    opengl::initialize_lobby(
+    LOBBY_RENDERER.set(Some(LobbyRenderer::new(
+        GRAPHICS_CONTEXT.with_borrow(|c| c.as_ref().unwrap().clone()),
         UVec2::new(preferred_view_width, preferred_view_height),
         convert_swapchain_array(swapchain_textures, swapchain_length),
         enable_srgb_correction,
-    );
+        "",
+    )));
 }
 
 #[no_mangle]
 pub extern "C" fn alvr_pause_opengl() {
-    opengl::pause();
+    STREAM_RENDERER.set(None);
+    LOBBY_RENDERER.set(None)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn alvr_update_hud_message_opengl(message: *const c_char) {
-    opengl::update_hud_message(CStr::from_ptr(message).to_str().unwrap());
+    LOBBY_RENDERER.with_borrow(|renderer| {
+        if let Some(renderer) = renderer {
+            renderer.update_hud_message(CStr::from_ptr(message).to_str().unwrap());
+        }
+    });
 }
 
 #[no_mangle]
@@ -758,14 +774,15 @@ pub unsafe extern "C" fn alvr_start_stream_opengl(config: AlvrStreamConfig) {
         edge_ratio_y: config.foveation_edge_ratio_y,
     });
 
-    opengl::start_stream(
+    STREAM_RENDERER.set(Some(StreamRenderer::new(
+        GRAPHICS_CONTEXT.with_borrow(|c| c.as_ref().unwrap().clone()),
         view_resolution,
         swapchain_textures,
         foveated_encoding,
         true,
         false, // TODO: limited range fix config
         1.0,   // TODO: encoding gamma config
-    );
+    )));
 }
 
 #[no_mangle]
@@ -783,7 +800,11 @@ pub unsafe extern "C" fn alvr_render_lobby_opengl(view_inputs: *const AlvrViewIn
         },
     ];
 
-    opengl::render_lobby(view_inputs);
+    LOBBY_RENDERER.with_borrow(|renderer| {
+        if let Some(renderer) = renderer {
+            renderer.render(view_inputs);
+        }
+    });
 }
 
 #[no_mangle]
@@ -791,8 +812,12 @@ pub unsafe extern "C" fn alvr_render_stream_opengl(
     hardware_buffer: *mut c_void,
     swapchain_indices: *const u32,
 ) {
-    opengl::render_stream(
-        hardware_buffer,
-        [*swapchain_indices, *swapchain_indices.offset(1)],
-    );
+    STREAM_RENDERER.with_borrow(|renderer| {
+        if let Some(renderer) = renderer {
+            renderer.render(
+                hardware_buffer,
+                [*swapchain_indices, *swapchain_indices.offset(1)],
+            );
+        }
+    });
 }
