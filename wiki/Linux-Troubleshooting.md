@@ -5,9 +5,11 @@ The steam runtimes SteamVR runs in break the alvr driver loaded by SteamVR.
 This causes the screen to stay black on the client or an error to be reported that the pipewire device is missing or can even result in SteamVR crashing.
 
 ### Fix
-Add `~/.steam/steam/steamapps/common/SteamVR/bin/vrmonitor.sh %command%` to the commandline options of SteamVR (SteamVR -> Manage/Right Click -> Properties -> General -> Launch Options).
+Add `~/.local/share/Steam/steamapps/common/SteamVR/bin/vrmonitor.sh %command%` to the commandline options of SteamVR (SteamVR -> Manage/Right Click -> Properties -> General -> Launch Options).
 
-The path might differ based on your installation of Steam, for example on systems using the deb-package like Debian and Mint `~/.steam/debian-installation/steamapps/common/SteamVR/bin/vrmonitor.sh %command%` is needed.
+This path might differ based on your Steam installation, in that case SteamVR will not start at all. If this is the case you can figure out the actual path by going to Steam Settings -> Storage.
+Then pick the storage location with the star emoji (⭐) and take the path directly above the usage statistics. Prepend this path to `steamapps/common/SteamVR/bin/vrmonitor.sh`.
+Finally put this entire path into the SteamVR commandline options instead of the other one.
 
 ## Amdvlk/AMD
 If you have Amdvlk installed on your system, it overrides other vulkan drivers and causes SteamVR to break. Use the `vulkan-radeon` driver (aka radv) instead.
