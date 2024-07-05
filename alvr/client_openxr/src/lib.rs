@@ -126,7 +126,7 @@ pub fn entry_point() {
         | Platform::Quest3
         | Platform::QuestPro
         | Platform::QuestUnknown => "_quest",
-        Platform::PicoNeo3 | Platform::PicoNeo3Link | Platform::Pico4 => "_pico",
+        Platform::PicoNeo3 | Platform::Pico4 => "_pico",
         Platform::Yvr => "_yvr",
         Platform::Lynx => "_lynx",
         _ => "",
@@ -255,6 +255,7 @@ pub fn entry_point() {
         let mut lobby = Lobby::new(
             &xr_context,
             Rc::clone(&graphics_context),
+            Arc::clone(&interaction_context),
             default_view_resolution,
             &last_lobby_message,
         );

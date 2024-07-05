@@ -733,13 +733,11 @@ pub unsafe extern "C" fn alvr_resume_opengl(
     preferred_view_height: u32,
     swapchain_textures: *mut *const u32,
     swapchain_length: u32,
-    enable_srgb_correction: bool,
 ) {
     LOBBY_RENDERER.set(Some(LobbyRenderer::new(
         GRAPHICS_CONTEXT.with_borrow(|c| c.as_ref().unwrap().clone()),
         UVec2::new(preferred_view_width, preferred_view_height),
         convert_swapchain_array(swapchain_textures, swapchain_length),
-        enable_srgb_correction,
         "",
     )));
 }
@@ -785,6 +783,7 @@ pub unsafe extern "C" fn alvr_start_stream_opengl(config: AlvrStreamConfig) {
     )));
 }
 
+// todo: support hands
 #[no_mangle]
 pub unsafe extern "C" fn alvr_render_lobby_opengl(view_inputs: *const AlvrViewInput) {
     let view_inputs = [
@@ -802,7 +801,7 @@ pub unsafe extern "C" fn alvr_render_lobby_opengl(view_inputs: *const AlvrViewIn
 
     LOBBY_RENDERER.with_borrow(|renderer| {
         if let Some(renderer) = renderer {
-            renderer.render(view_inputs);
+            renderer.render(view_inputs, [(None, None), (None, None)]);
         }
     });
 }
