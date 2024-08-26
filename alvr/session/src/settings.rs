@@ -1,4 +1,7 @@
-use alvr_common::{LogSeverity, LogSeverityDefault, LogSeverityDefaultVariant};
+use alvr_common::{
+    DebugGroupsConfig, DebugGroupsConfigDefault, LogSeverity, LogSeverityDefault,
+    LogSeverityDefaultVariant,
+};
 use bytemuck::{Pod, Zeroable};
 use serde::{Deserialize, Serialize};
 use settings_schema::{
@@ -455,11 +458,11 @@ pub struct FoveatedEncodingConfig {
 #[repr(C)]
 #[derive(SettingsSchema, Clone, Copy, Serialize, Deserialize, Pod, Zeroable)]
 pub struct ColorCorrectionConfig {
-    #[schema(gui(slider(min = -1.0, max = 1.0, step = 0.01)))]
+    #[schema(gui(slider(min = -1.0, max = 1.0, step = 0.001)))]
     #[schema(flag = "steamvr-restart")]
     pub brightness: f32,
 
-    #[schema(gui(slider(min = -1.0, max = 1.0, step = 0.01)))]
+    #[schema(gui(slider(min = -1.0, max = 1.0, step = 0.001)))]
     #[schema(flag = "steamvr-restart")]
     pub contrast: f32,
 
@@ -568,15 +571,6 @@ pub struct VideoConfig {
     pub clientside_foveation: Switch<ClientsideFoveationConfig>,
 }
 
-#[derive(SettingsSchema, Serialize, Deserialize, Clone, Copy)]
-#[schema(gui = "button_group")]
-pub enum LinuxAudioBackend {
-    #[schema(strings(display_name = "ALSA"))]
-    Alsa,
-
-    Jack,
-}
-
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
 #[schema(gui = "button_group")]
 pub enum CustomAudioDeviceConfig {
@@ -601,8 +595,10 @@ pub struct AudioBufferingConfig {
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
 #[schema(collapsible)]
 pub struct GameAudioConfig {
+    #[cfg_attr(target_os = "linux", schema(flag = "hidden"))]
     pub device: Option<CustomAudioDeviceConfig>,
 
+    #[cfg_attr(target_os = "linux", schema(flag = "hidden"))]
     #[schema(strings(display_name = "Mute desktop audio when streaming"))]
     pub mute_when_streaming: bool,
 
@@ -633,7 +629,9 @@ pub enum MicrophoneDevicesConfig {
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
 #[schema(collapsible)]
 pub struct MicrophoneConfig {
+    #[cfg_attr(target_os = "linux", schema(flag = "hidden"))]
     pub devices: MicrophoneDevicesConfig,
+
     pub buffering: AudioBufferingConfig,
 }
 
@@ -644,9 +642,6 @@ pub struct AudioConfig {
 
     #[schema(strings(display_name = "Headset microphone"))]
     pub microphone: Switch<MicrophoneConfig>,
-
-    #[schema(strings(help = "ALSA is recommended for most PulseAudio or PipeWire-based setups"))]
-    pub linux_backend: LinuxAudioBackend,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
@@ -782,8 +777,7 @@ pub struct AutomaticButtonMappingConfig {
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
-#[schema(collapsible)]
-pub struct HandGestureConfig {
+pub struct HandTrackingInteractionConfig {
     #[schema(flag = "real-time")]
     pub only_touch: bool,
 
@@ -874,23 +868,32 @@ pub struct HapticsConfig {
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
+pub struct HandSkeletonConfig {
+    #[schema(flag = "steamvr-restart")]
+    #[schema(strings(
+        help = r"Enabling this will use separate tracker objects with the full skeletal tracking level when hand tracking is detected. This is required for VRChat hand tracking."
+    ))]
+    pub use_separate_trackers: bool,
+}
+
+#[derive(SettingsSchema, Serialize, Deserialize, Clone)]
 #[schema(collapsible)]
 pub struct ControllersConfig {
     #[schema(strings(help = "Turning this off will make the controllers appear powered off."))]
     #[schema(flag = "real-time")]
     pub tracked: bool,
 
-    #[schema(flag = "real-time")]
+    #[schema(flag = "steamvr-restart")]
     #[schema(strings(
         help = "Enabling this passes skeletal hand data (finger tracking) to SteamVR."
     ))]
-    pub enable_skeleton: bool,
+    pub hand_skeleton: Switch<HandSkeletonConfig>,
 
     #[schema(flag = "real-time")]
     #[schema(strings(
         help = "Enabling this allows using hand gestures to emulate controller inputs."
     ))]
-    pub gestures: Switch<HandGestureConfig>,
+    pub hand_tracking_interaction: Switch<HandTrackingInteractionConfig>,
 
     #[schema(strings(
         display_name = "Prediction",
@@ -1146,6 +1149,10 @@ pub struct LoggingConfig {
 
     #[schema(flag = "real-time")]
     pub log_haptics: bool,
+
+    #[cfg_attr(not(debug_assertions), schema(flag = "hidden"))]
+    #[schema(strings(help = "These settings enable extra spammy logs for debugging purposes."))]
+    pub debug_groups: DebugGroupsConfig,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
@@ -1440,11 +1447,8 @@ pub fn session_settings_default() -> SettingsDefault {
             },
         },
         audio: AudioConfigDefault {
-            linux_backend: LinuxAudioBackendDefault {
-                variant: LinuxAudioBackendDefaultVariant::Alsa,
-            },
             game_audio: SwitchDefault {
-                enabled: !cfg!(target_os = "linux"),
+                enabled: true,
                 content: GameAudioConfigDefault {
                     gui_collapsed: true,
                     device: OptionalDefault {
@@ -1460,7 +1464,7 @@ pub fn session_settings_default() -> SettingsDefault {
                 },
             },
             microphone: SwitchDefault {
-                enabled: false,
+                enabled: cfg!(target_os = "linux"),
                 content: MicrophoneConfigDefault {
                     gui_collapsed: true,
                     devices: MicrophoneDevicesConfigDefault {
@@ -1530,7 +1534,12 @@ pub fn session_settings_default() -> SettingsDefault {
                 content: ControllersConfigDefault {
                     gui_collapsed: false,
                     tracked: true,
-                    enable_skeleton: true,
+                    hand_skeleton: SwitchDefault {
+                        enabled: true,
+                        content: HandSkeletonConfigDefault {
+                            use_separate_trackers: true,
+                        },
+                    },
                     emulation_mode: ControllersEmulationModeDefault {
                         Custom: ControllersEmulationModeCustomDefault {
                             serial_number: "ALVR Controller".into(),
@@ -1587,11 +1596,10 @@ pub fn session_settings_default() -> SettingsDefault {
                         },
                         force_threshold: 0.8,
                     },
-                    gestures: SwitchDefault {
-                        enabled: true,
-                        content: HandGestureConfigDefault {
-                            gui_collapsed: true,
-                            only_touch: true,
+                    hand_tracking_interaction: SwitchDefault {
+                        enabled: false,
+                        content: HandTrackingInteractionConfigDefault {
+                            only_touch: false,
                             pinch_touch_distance: 0.0,
                             pinch_trigger_distance: 0.25,
                             curl_touch_distance: 2.0,
@@ -1708,6 +1716,18 @@ pub fn session_settings_default() -> SettingsDefault {
                 },
                 prefer_backtrace: false,
                 show_notification_tip: true,
+                debug_groups: DebugGroupsConfigDefault {
+                    server_impl: false,
+                    client_impl: false,
+                    server_core: false,
+                    client_core: false,
+                    connection: false,
+                    sockets: false,
+                    server_gfx: false,
+                    client_gfx: false,
+                    encoder: false,
+                    decoder: false,
+                },
             },
             steamvr_launcher: SteamvrLauncherDefault {
                 driver_launch_action: DriverLaunchActionDefault {

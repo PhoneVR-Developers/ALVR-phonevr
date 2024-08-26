@@ -5,6 +5,7 @@ use crate::{
 use alvr_filesystem as afs;
 use std::{
     env::consts::OS,
+    fs,
     path::{Path, PathBuf},
 };
 use xshell::{cmd, Shell};
@@ -123,7 +124,7 @@ pub fn include_licenses(root_path: &Path, gpl: bool) {
     )
     .unwrap();
     sh.copy_file(
-        afs::crate_dir("server").join("LICENSE-Valve"),
+        afs::crate_dir("server_openvr").join("LICENSE-Valve"),
         licenses_dir.join("Valve.txt"),
     )
     .unwrap();
@@ -193,10 +194,31 @@ pub fn package_launcher(appimage: bool) {
     }
 }
 
-pub fn package_client_lib(link_stdcpp: bool) {
+pub fn replace_client_openxr_manifest(from_pattern: &str, to: &str) {
+    let manifest_path = afs::crate_dir("client_openxr").join("Cargo.toml");
+    let manifest_string = fs::read_to_string(&manifest_path)
+        .unwrap()
+        .replace(from_pattern, to);
+
+    fs::write(manifest_path, manifest_string).unwrap();
+}
+
+pub fn package_client_openxr(for_meta_store: bool) {
+    if for_meta_store {
+        replace_client_openxr_manifest(
+            r#"package = "alvr.client.stable""#,
+            r#"package = "alvr.client""#,
+        );
+        replace_client_openxr_manifest(r#"value = "all""#, r#"value = "quest2|questpro|quest3""#);
+    }
+
+    build::build_android_client(Profile::Distribution);
+}
+
+pub fn package_client_lib(link_stdcpp: bool, all_targets: bool) {
     let sh = Shell::new().unwrap();
 
-    build::build_android_client_core_lib(Profile::Distribution, link_stdcpp);
+    build::build_android_client_core_lib(Profile::Distribution, link_stdcpp, all_targets);
 
     command::zip(&sh, &afs::build_dir().join("alvr_client_core")).unwrap();
 }
