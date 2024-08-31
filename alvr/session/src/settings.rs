@@ -682,14 +682,12 @@ pub struct FaceTrackingConfig {
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq)]
 pub struct BodyTrackingSourcesConfig {
-    pub body_tracking_full_body_meta: Switch<BodyTrackingFullBodyMETAConfig>,
+    pub body_tracking_fb: Switch<BodyTrackingFBConfig>,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq)]
-#[schema(collapsible)]
-pub struct BodyTrackingFullBodyMETAConfig {
-    #[schema(strings(help = "Enable full body tracking"))]
-    pub enable_full_body: bool,
+pub struct BodyTrackingFBConfig {
+    pub full_body: bool,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
@@ -1301,7 +1299,7 @@ pub fn session_settings_default() -> SettingsDefault {
                     variant: BitrateModeDefaultVariant::ConstantMbps,
                 },
                 adapt_to_framerate: SwitchDefault {
-                    enabled: true,
+                    enabled: false,
                     content: BitrateAdaptiveFramerateConfigDefault {
                         framerate_reset_threshold_multiplier: 2.0,
                     },
@@ -1514,12 +1512,9 @@ pub fn session_settings_default() -> SettingsDefault {
                 content: BodyTrackingConfigDefault {
                     gui_collapsed: true,
                     sources: BodyTrackingSourcesConfigDefault {
-                        body_tracking_full_body_meta: SwitchDefault {
+                        body_tracking_fb: SwitchDefault {
                             enabled: true,
-                            content: BodyTrackingFullBodyMETAConfigDefault {
-                                gui_collapsed: true,
-                                enable_full_body: true,
-                            },
+                            content: BodyTrackingFBConfigDefault { full_body: true },
                         },
                     },
                     sink: BodyTrackingSinkConfigDefault {
