@@ -7,7 +7,7 @@ authors.workspace = true
 license.workspace = true
 
 [lib]
-crate_type = ["rlib", "staticlib", "cdylib"]
+crate-type = ["rlib", "staticlib", "cdylib"]
 
 [features]
 link-stdcpp-shared = []
@@ -20,6 +20,7 @@ alvr_common.workspace = true
 alvr_packets.workspace = true
 alvr_session.workspace = true
 alvr_sockets.workspace = true
+alvr_system_info.workspace = true
 
 app_dirs2 = "2"
 bincode = "1"
@@ -48,6 +49,6 @@ oboe = "0.6"                                                    # todo: remove o
 env_logger = "0.11"
 
 [build-dependencies]
-bindgen = "0.69"
+bindgen = "0.70"
 cc = { version = "1", features = ["parallel"] }
 walkdir = "2"

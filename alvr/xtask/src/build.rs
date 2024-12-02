@@ -27,12 +27,7 @@ impl Display for Profile {
     }
 }
 
-pub fn build_server_lib(
-    profile: Profile,
-    enable_messagebox: bool,
-    root: Option<String>,
-    reproducible: bool,
-) {
+pub fn build_server_lib(profile: Profile, root: Option<String>, reproducible: bool) {
     let sh = Shell::new().unwrap();
 
     let mut flags = vec![];
@@ -43,10 +38,6 @@ pub fn build_server_lib(
         }
         Profile::Release => flags.push("--release"),
         Profile::Debug => (),
-    }
-    if enable_messagebox {
-        flags.push("--features");
-        flags.push("alvr_common/enable-messagebox");
     }
     if reproducible {
         flags.push("--locked");
@@ -82,7 +73,6 @@ pub fn build_server_lib(
 
 pub fn build_streamer(
     profile: Profile,
-    enable_messagebox: bool,
     gpl: bool,
     root: Option<String>,
     reproducible: bool,
@@ -102,16 +92,23 @@ pub fn build_streamer(
         Profile::Release => common_flags.push("--release"),
         Profile::Debug => (),
     }
-    if enable_messagebox {
-        common_flags.push("--features");
-        common_flags.push("alvr_common/enable-messagebox");
-    }
     if reproducible {
         common_flags.push("--locked");
     }
-    let common_flags_ref = &common_flags;
 
-    let artifacts_dir = afs::target_dir().join(profile.to_string());
+    let artifacts_dir = if cfg!(all(windows, target_arch = "aarch64")) {
+        // Fix for cross compilation
+        const TARGET: &str = "x86_64-pc-windows-msvc";
+
+        common_flags.push("--target");
+        common_flags.push(TARGET);
+
+        afs::target_dir().join(TARGET).join(profile.to_string())
+    } else {
+        afs::target_dir().join(profile.to_string())
+    };
+
+    let common_flags_ref = &common_flags;
 
     let maybe_config = if keep_config {
         fs::read_to_string(build_layout.session()).ok()
@@ -119,7 +116,7 @@ pub fn build_streamer(
         None
     };
 
-    sh.remove_path(afs::streamer_build_dir()).unwrap();
+    sh.remove_path(afs::streamer_build_dir()).ok();
     sh.create_dir(build_layout.openvr_driver_lib_dir()).unwrap();
     sh.create_dir(&build_layout.executables_dir).unwrap();
 
@@ -269,7 +266,7 @@ pub fn build_streamer(
     }
 }
 
-pub fn build_launcher(profile: Profile, enable_messagebox: bool, reproducible: bool) {
+pub fn build_launcher(profile: Profile, reproducible: bool) {
     let sh = Shell::new().unwrap();
 
     let mut common_flags = vec![];
@@ -280,10 +277,6 @@ pub fn build_launcher(profile: Profile, enable_messagebox: bool, reproducible: b
         }
         Profile::Release => common_flags.push("--release"),
         Profile::Debug => (),
-    }
-    if enable_messagebox {
-        common_flags.push("--features");
-        common_flags.push("alvr_common/enable-messagebox");
     }
     if reproducible {
         common_flags.push("--locked");

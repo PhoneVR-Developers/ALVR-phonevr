@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub use anyhow;
+pub use glam;
 pub use log;
 pub use once_cell;
 pub use parking_lot;
@@ -35,6 +36,7 @@ pub const fn lazy_mut_none<T>() -> OptLazy<T> {
 
 // Simple wrapper for AtomicBool when using Ordering::Relaxed. Deref cannot be implemented (cannot
 // return local reference)
+#[derive(Default)]
 pub struct RelaxedAtomic(AtomicBool);
 
 impl RelaxedAtomic {

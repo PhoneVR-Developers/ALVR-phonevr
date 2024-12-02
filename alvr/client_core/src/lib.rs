@@ -7,9 +7,7 @@
 
 mod c_api;
 mod connection;
-mod decoder;
 mod logging_backend;
-mod platform;
 mod sockets;
 mod statistics;
 mod storage;
@@ -18,20 +16,21 @@ mod storage;
 mod audio;
 
 pub mod graphics;
+pub mod video_decoder;
 
 use alvr_common::{
     dbg_client_core, error,
-    glam::{UVec2, Vec2, Vec3},
+    glam::{Quat, UVec2, Vec2, Vec3},
     parking_lot::{Mutex, RwLock},
-    warn, ConnectionState, DeviceMotion, LifecycleState, Pose, HEAD_ID,
+    warn, ConnectionState, DeviceMotion, LifecycleState, Pose, HAND_LEFT_ID, HAND_RIGHT_ID,
+    HEAD_ID,
 };
 use alvr_packets::{
-    BatteryInfo, ButtonEntry, ClientControlPacket, FaceData, NegotiatedStreamingConfig,
-    ReservedClientControlPacket, Tracking, ViewParams, ViewsConfig,
+    BatteryInfo, ButtonEntry, ClientControlPacket, FaceData, ReservedClientControlPacket,
+    StreamConfig, Tracking, ViewParams, ViewsConfig,
 };
-use alvr_session::{CodecType, Settings};
+use alvr_session::CodecType;
 use connection::ConnectionContext;
-use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashSet, VecDeque},
     sync::Arc,
@@ -40,25 +39,12 @@ use std::{
 };
 use storage::Config;
 
+pub use alvr_system_info::Platform;
 pub use logging_backend::init_logging;
-pub use platform::Platform;
 
-#[cfg(target_os = "android")]
-pub use platform::try_get_permission;
-
-const IPD_CHANGE_EPS: f32 = 0.001;
-
-pub fn platform() -> Platform {
-    platform::platform()
-}
-
-#[derive(Serialize, Deserialize)]
 pub enum ClientCoreEvent {
     UpdateHudMessage(String),
-    StreamingStarted {
-        settings: Box<Settings>,
-        negotiated_config: NegotiatedStreamingConfig,
-    },
+    StreamingStarted(Box<StreamConfig>),
     StreamingStopped,
     Haptics {
         device_id: u64,
@@ -71,29 +57,21 @@ pub enum ClientCoreEvent {
         codec: CodecType,
         config_nal: Vec<u8>,
     },
-    FrameReady {
-        timestamp: Duration,
-        view_params: [ViewParams; 2],
-        nal: Vec<u8>,
-    },
-}
-
-pub struct DecodedFrame {
-    pub timestamp: Duration,
-    pub view_params: [ViewParams; 2],
-    pub buffer_ptr: *mut std::ffi::c_void,
 }
 
 // Note: this struct may change without breaking network protocol changes
 #[derive(Clone)]
 pub struct ClientCapabilities {
     pub default_view_resolution: UVec2,
-    pub external_decoder: bool,
     pub refresh_rates: Vec<f32>,
     pub foveated_encoding: bool,
     pub encoder_high_profile: bool,
     pub encoder_10_bits: bool,
     pub encoder_av1: bool,
+    pub prefer_10bit: bool,
+    pub prefer_full_range: bool,
+    pub preferred_encoding_gamma: f32,
+    pub prefer_hdr: bool,
 }
 
 pub struct ClientCoreContext {
@@ -116,8 +94,8 @@ impl ClientCoreContext {
         #[cfg(target_os = "android")]
         {
             dbg_client_core!("Getting permissions");
-            platform::try_get_permission(platform::MICROPHONE_PERMISSION);
-            platform::set_wifi_lock(true);
+            alvr_system_info::try_get_permission(alvr_system_info::MICROPHONE_PERMISSION);
+            alvr_system_info::set_wifi_lock(true);
         }
 
         let lifecycle_state = Arc::new(RwLock::new(LifecycleState::Idle));
@@ -231,62 +209,88 @@ impl ClientCoreContext {
         }
     }
 
+    // These must be in its local space, as if the head pose is in the origin.
+    pub fn send_view_params(&self, views: [ViewParams; 2]) {
+        dbg_client_core!("send_view_params");
+
+        *self.connection_context.view_params.write() = views;
+
+        if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
+            sender
+                .send(&ClientControlPacket::ViewsConfig(ViewsConfig {
+                    fov: [views[0].fov, views[1].fov],
+                    ipd_m: (views[0].pose.position - views[1].pose.position).length(),
+                }))
+                .ok();
+        }
+    }
+
     pub fn send_tracking(
         &self,
-        target_timestamp: Duration,
-        views: [ViewParams; 2],
+        poll_timestamp: Duration,
         mut device_motions: Vec<(u64, DeviceMotion)>,
         hand_skeletons: [Option<[Pose; 26]>; 2],
         face_data: FaceData,
     ) {
         dbg_client_core!("send_tracking");
 
-        let last_ipd = {
-            let mut view_params_queue_lock = self.connection_context.view_params_queue.write();
-
-            let last_ipd = if let Some((_, params)) = view_params_queue_lock.front() {
-                (params[0].pose.position - params[1].pose.position).length()
+        let target_timestamp =
+            if let Some(stats) = &*self.connection_context.statistics_manager.lock() {
+                poll_timestamp + stats.average_total_pipeline_latency()
             } else {
-                0.0
+                poll_timestamp
             };
 
-            view_params_queue_lock.push_back((target_timestamp, views));
+        for (id, motion) in &mut device_motions {
+            if *id == *HEAD_ID {
+                *motion = predict_motion(target_timestamp, poll_timestamp, *motion);
 
-            while view_params_queue_lock.len() > 1024 {
-                view_params_queue_lock.pop_front();
+                let mut head_pose_queue = self.connection_context.head_pose_queue.write();
+
+                head_pose_queue.push_back((target_timestamp, motion.pose));
+
+                while head_pose_queue.len() > 1024 {
+                    head_pose_queue.pop_front();
+                }
+
+                // This is done for backward compatibiity for the v20 protocol. Will be removed with the
+                // tracking rewrite protocol extension.
+                motion.linear_velocity = Vec3::ZERO;
+                motion.angular_velocity = Vec3::ZERO;
+            } else if let Some(stats) = &*self.connection_context.statistics_manager.lock() {
+                let tracker_timestamp = poll_timestamp + stats.tracker_prediction_offset();
+
+                *motion = predict_motion(tracker_timestamp, poll_timestamp, *motion);
+            }
+        }
+
+        // send_tracking() expects hand data in the multimodal protocol. In case multimodal protocol
+        // is not supported, convert back to legacy protocol.
+        if !self.connection_context.uses_multimodal_protocol.value() {
+            if hand_skeletons[0].is_some() {
+                device_motions.push((
+                    *HAND_LEFT_ID,
+                    DeviceMotion {
+                        pose: hand_skeletons[0].unwrap()[0],
+                        linear_velocity: Vec3::ZERO,
+                        angular_velocity: Vec3::ZERO,
+                    },
+                ));
             }
 
-            last_ipd
-        };
-
-        {
-            let ipd = (views[0].pose.position - views[1].pose.position).length();
-            if f32::abs(last_ipd - ipd) > IPD_CHANGE_EPS {
-                if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
-                    sender
-                        .send(&ClientControlPacket::ViewsConfig(ViewsConfig {
-                            fov: [views[0].fov, views[1].fov],
-                            ipd_m: ipd,
-                        }))
-                        .ok();
-                }
+            if hand_skeletons[1].is_some() {
+                device_motions.push((
+                    *HAND_RIGHT_ID,
+                    DeviceMotion {
+                        pose: hand_skeletons[1].unwrap()[0],
+                        linear_velocity: Vec3::ZERO,
+                        angular_velocity: Vec3::ZERO,
+                    },
+                ));
             }
         }
 
         if let Some(sender) = &mut *self.connection_context.tracking_sender.lock() {
-            device_motions.push((
-                *HEAD_ID,
-                DeviceMotion {
-                    pose: Pose {
-                        orientation: views[0].pose.orientation,
-                        position: views[0].pose.position
-                            + (views[1].pose.position - views[0].pose.position) / 2.0,
-                    },
-                    linear_velocity: Vec3::ZERO,
-                    angular_velocity: Vec3::ZERO,
-                },
-            ));
-
             sender
                 .send_header(&Tracking {
                     target_timestamp,
@@ -302,98 +306,72 @@ impl ClientCoreContext {
         }
     }
 
-    pub fn get_head_prediction_offset(&self) -> Duration {
-        dbg_client_core!("get_head_prediction_offset");
+    /// The callback should return true if the frame was successfully submitted to the decoder
+    pub fn set_decoder_input_callback(
+        &self,
+        callback: Box<dyn FnMut(Duration, &[u8]) -> bool + Send>,
+    ) {
+        dbg_client_core!("set_decoder_input_callback");
 
-        if let Some(stats) = &*self.connection_context.statistics_manager.lock() {
-            stats.average_total_pipeline_latency()
-        } else {
-            Duration::ZERO
-        }
-    }
-
-    pub fn get_tracker_prediction_offset(&self) -> Duration {
-        dbg_client_core!("get_tracker_prediction_offset");
-
-        if let Some(stats) = &*self.connection_context.statistics_manager.lock() {
-            stats.tracker_prediction_offset()
-        } else {
-            Duration::ZERO
-        }
-    }
-
-    pub fn get_frame(&self) -> Option<DecodedFrame> {
-        dbg_client_core!("get_frame");
-
-        let mut decoder_source_lock = self.connection_context.decoder_source.lock();
-        let decoder_source = decoder_source_lock.as_mut()?;
-
-        let (frame_timestamp, buffer_ptr) = match decoder_source.get_frame() {
-            Ok(maybe_pair) => maybe_pair?,
-            Err(e) => {
-                error!("Error getting frame, restarting connection: {}", e);
-
-                // The connection loop observes changes on this value
-                *self.connection_context.state.write() = ConnectionState::Disconnecting;
-
-                return None;
-            }
-        };
-
-        if let Some(stats) = &mut *self.connection_context.statistics_manager.lock() {
-            stats.report_compositor_start(frame_timestamp);
-        }
-
-        let mut view_params = *self.connection_context.last_good_view_params.read();
-        for (timestamp, views) in &*self.connection_context.view_params_queue.read() {
-            if *timestamp == frame_timestamp {
-                view_params = *views;
-                break;
-            }
-        }
-
-        Some(DecodedFrame {
-            timestamp: frame_timestamp,
-            view_params,
-            buffer_ptr,
-        })
-    }
-
-    /// Call only with external decoder
-    pub fn request_idr(&self) {
-        dbg_client_core!("request_idr");
+        *self.connection_context.decoder_callback.lock() = Some(callback);
 
         if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
             sender.send(&ClientControlPacket::RequestIdr).ok();
         }
     }
 
-    /// Call only with external decoder
-    pub fn report_frame_decoded(&self, target_timestamp: Duration) {
+    pub fn report_frame_decoded(&self, timestamp: Duration) {
         dbg_client_core!("report_frame_decoded");
 
         if let Some(stats) = &mut *self.connection_context.statistics_manager.lock() {
-            stats.report_frame_decoded(target_timestamp);
+            stats.report_frame_decoded(timestamp);
         }
     }
 
-    /// Call only with external decoder
-    pub fn report_compositor_start(&self, target_timestamp: Duration) {
+    pub fn report_fatal_decoder_error(&self, error: &str) {
+        error!("Fatal decoder error, restarting connection: {error}");
+
+        // The connection loop observes changes on this value
+        *self.connection_context.state.write() = ConnectionState::Disconnecting;
+    }
+
+    pub fn report_compositor_start(&self, timestamp: Duration) -> [ViewParams; 2] {
         dbg_client_core!("report_compositor_start");
 
         if let Some(stats) = &mut *self.connection_context.statistics_manager.lock() {
-            stats.report_compositor_start(target_timestamp);
+            stats.report_compositor_start(timestamp);
         }
+
+        let mut head_pose = *self.connection_context.last_good_head_pose.read();
+        for (ts, pose) in &*self.connection_context.head_pose_queue.read() {
+            if *ts == timestamp {
+                head_pose = *pose;
+                break;
+            }
+        }
+        let view_params = self.connection_context.view_params.read();
+        let view_params = [
+            ViewParams {
+                pose: head_pose * view_params[0].pose,
+                fov: view_params[0].fov,
+            },
+            ViewParams {
+                pose: head_pose * view_params[1].pose,
+                fov: view_params[1].fov,
+            },
+        ];
+
+        view_params
     }
 
-    pub fn report_submit(&self, target_timestamp: Duration, vsync_queue: Duration) {
+    pub fn report_submit(&self, timestamp: Duration, vsync_queue: Duration) {
         dbg_client_core!("report_submit");
 
         if let Some(stats) = &mut *self.connection_context.statistics_manager.lock() {
-            stats.report_submit(target_timestamp, vsync_queue);
+            stats.report_submit(timestamp, vsync_queue);
 
             if let Some(sender) = &mut *self.connection_context.statistics_sender.lock() {
-                if let Some(stats) = stats.summary(target_timestamp) {
+                if let Some(stats) = stats.summary(timestamp) {
                     sender.send_header(&stats).ok();
                 } else {
                     warn!("Statistics summary not ready!");
@@ -414,6 +392,28 @@ impl Drop for ClientCoreContext {
         }
 
         #[cfg(target_os = "android")]
-        platform::set_wifi_lock(false);
+        alvr_system_info::set_wifi_lock(false);
+    }
+}
+
+pub fn predict_motion(
+    target_timestamp: Duration,
+    current_timestamp: Duration,
+    motion: DeviceMotion,
+) -> DeviceMotion {
+    let delta_time_s = target_timestamp
+        .saturating_sub(current_timestamp)
+        .as_secs_f32();
+
+    let delta_position = motion.linear_velocity * delta_time_s;
+    let delta_orientation = Quat::from_scaled_axis(motion.angular_velocity * delta_time_s);
+
+    DeviceMotion {
+        pose: Pose {
+            orientation: delta_orientation * motion.pose.orientation,
+            position: motion.pose.position + delta_position,
+        },
+        linear_velocity: motion.linear_velocity,
+        angular_velocity: motion.angular_velocity,
     }
 }

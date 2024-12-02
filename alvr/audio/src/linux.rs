@@ -1,4 +1,4 @@
-use alvr_common::{anyhow::Result, debug, error, parking_lot::Mutex};
+use alvr_common::{anyhow::Result, debug, error, parking_lot::Mutex, ConnectionError};
 use alvr_session::AudioBufferingConfig;
 use alvr_sockets::{StreamReceiver, StreamSender};
 use pipewire::{
@@ -10,7 +10,7 @@ use pipewire::{
     },
     stream::{StreamFlags, StreamListener, StreamState},
 };
-use std::{cmp, collections::VecDeque, sync::Arc, thread};
+use std::{cmp, collections::VecDeque, sync::Arc, thread, time::Duration};
 struct Terminate;
 
 pub fn play_microphone_loop_pipewire(
@@ -71,6 +71,15 @@ pub fn play_microphone_loop_pipewire(
             average_buffer_frames_count,
         )
         .ok();
+
+        // if we end up here then no consumer is currently connected to the output,
+        // so discard audio packets to not cause a buildup
+        if matches!(
+            receiver.recv(Duration::from_millis(500)),
+            Err(ConnectionError::Other(_))
+        ) {
+            break;
+        };
     }
 
     if pw_sender.send(Terminate).is_err() {
@@ -218,7 +227,9 @@ pub fn record_audio_blocking_pipewire(
     let is_running_clone_for_pw_terminate: Arc<dyn Fn() -> bool + Send + Sync> =
         Arc::clone(&is_running);
     thread::spawn(move || {
-        while is_running_clone_for_pw_terminate() {}
+        while is_running_clone_for_pw_terminate() {
+            thread::sleep(Duration::from_millis(500));
+        }
         if pw_sender.send(Terminate).is_err() {
             error!(
                 "Couldn't send pipewire termination signal, deinitializing forcefully.

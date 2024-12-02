@@ -27,6 +27,7 @@ pub fn swapchain_format(
     graphics::choose_swapchain_format(&formats, enable_hdr)
 }
 
+#[allow(unused_variables)]
 pub fn create_swapchain(
     session: &xr::Session<xr::OpenGlEs>,
     gfx_ctx: &GraphicsContext,
@@ -48,41 +49,48 @@ pub fn create_swapchain(
         mip_count: 1,
     };
 
-    if let Some(foveation) = foveation {
-        let swapchain = session
-            .create_swapchain_with_foveation(
-                &swapchain_info,
-                xr::SwapchainCreateFoveationFlagsFB::SCALED_BIN,
-            )
-            .unwrap();
-
-        swapchain.update_foveation(foveation).unwrap();
-
-        swapchain
-    } else {
-        session.create_swapchain(&swapchain_info).unwrap()
-    }
+    session.create_swapchain(&swapchain_info).unwrap()
 }
 
-// This is needed to work around lifetime limitations
-pub struct CompositionLayerBuilder<'a> {
+pub struct ProjectionLayerAlphaConfig {
+    pub premultiplied: bool,
+}
+
+// This is needed to work around lifetime limitations. Deref cannot be implemented because there are
+// nested references, and in a way or the other I would get `cannot return reference to temporary
+// value`
+pub struct ProjectionLayerBuilder<'a> {
     reference_space: &'a xr::Space,
     layers: [xr::CompositionLayerProjectionView<'a, xr::OpenGlEs>; 2],
+    alpha: Option<ProjectionLayerAlphaConfig>,
 }
 
-impl<'a> CompositionLayerBuilder<'a> {
+impl<'a> ProjectionLayerBuilder<'a> {
     pub fn new(
         reference_space: &'a xr::Space,
         layers: [xr::CompositionLayerProjectionView<'a, xr::OpenGlEs>; 2],
+        alpha: Option<ProjectionLayerAlphaConfig>,
     ) -> Self {
         Self {
             reference_space,
             layers,
+            alpha,
         }
     }
 
     pub fn build(&self) -> xr::CompositionLayerProjection<xr::OpenGlEs> {
+        let mut flags = xr::CompositionLayerFlags::EMPTY;
+
+        if let Some(alpha) = &self.alpha {
+            flags |= xr::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA;
+
+            if !alpha.premultiplied {
+                flags |= xr::CompositionLayerFlags::UNPREMULTIPLIED_ALPHA;
+            }
+        }
+
         xr::CompositionLayerProjection::new()
+            .layer_flags(flags)
             .space(self.reference_space)
             .views(&self.layers)
     }

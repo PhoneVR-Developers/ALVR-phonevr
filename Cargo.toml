@@ -5,11 +5,12 @@ members = ["alvr/*"]
 [workspace.package]
 version = "21.0.0-dev01"
 edition = "2021"
-rust-version = "1.76"
+rust-version = "1.77"
 authors = ["alvr-org"]
 license = "MIT"
 
 [workspace.dependencies]
+alvr_adb = { path = "alvr/adb" }
 alvr_audio = { path = "alvr/audio" }
 alvr_client_core = { path = "alvr/client_core" }
 alvr_common = { path = "alvr/common" }
@@ -21,6 +22,7 @@ alvr_server_core = { path = "alvr/server_core"}
 alvr_server_io = { path = "alvr/server_io" }
 alvr_session = { path = "alvr/session" }
 alvr_sockets = { path = "alvr/sockets" }
+alvr_system_info = { path = "alvr/system_info" }
 
 [profile.release]
 debug = "limited"

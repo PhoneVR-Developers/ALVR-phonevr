@@ -7,16 +7,16 @@ authors.workspace = true
 license.workspace = true
 
 [lib]
-crate_type = ["cdylib"]
+crate-type = ["cdylib"]
 
 [dependencies]
 alvr_common.workspace = true
 alvr_client_core.workspace = true
 alvr_packets.workspace = true
 alvr_session.workspace = true
+alvr_system_info.workspace = true
 
-openxr = { git = "https://github.com/alvr-org/openxrs", rev = "f1f47ff" }
-# openxr = { path = "../../../../openxrs/openxr" }
+openxr = { git = "https://github.com/Ralith/openxrs", rev = "9270509d23dc774b43a8b7289e8adf69fcac6828" }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6", features = ["native-activity"] }
@@ -25,7 +25,7 @@ libc = "0.2"
 ndk-context = "0.1"
 
 [package.metadata.android]
-package = "alvr.client.dev" # Changed for Meta Store
+package = "alvr.client.dev"                # Changed for Meta Store
 install_location = "auto"
 build_targets = ["aarch64-linux-android"]
 runtime_libs = "../../deps/android_openxr"
@@ -48,6 +48,7 @@ required = true
 [[package.metadata.android.uses_feature]]
 name = "android.hardware.vr.headtracking"
 required = true
+version = 1
 [[package.metadata.android.uses_feature]]
 opengles_version = [3, 2]
 required = true
@@ -71,6 +72,8 @@ name = "org.khronos.openxr.permission.OPENXR"
 [[package.metadata.android.uses_permission]]
 name = "org.khronos.openxr.permission.OPENXR_SYSTEM"
 
+[[package.metadata.android.queries.intent]]
+actions = ["org.khronos.openxr.OpenXRRuntimeService"]
 [[package.metadata.android.queries.provider]]
 name = "org.khronos.openxr"
 authorities = "org.khronos.openxr.runtime_broker;org.khronos.openxr.system_runtime_broker"
@@ -106,16 +109,19 @@ required = false
 name = "oculus.software.handtracking"
 required = false
 [[package.metadata.android.uses_feature]]
+name = "com.oculus.feature.PASSTHROUGH"
+required = false
+[[package.metadata.android.uses_feature]]
 name = "com.oculus.software.body_tracking"
 required = false
+[[package.metadata.android.uses_permission]]
+name = "com.oculus.permission.BODY_TRACKING"
 [[package.metadata.android.uses_permission]]
 name = "com.oculus.permission.EYE_TRACKING"
 [[package.metadata.android.uses_permission]]
 name = "com.oculus.permission.FACE_TRACKING"
 [[package.metadata.android.uses_permission]]
 name = "com.oculus.permission.HAND_TRACKING"
-[[package.metadata.android.uses_permission]]
-name = "com.oculus.permission.BODY_TRACKING"
 [[package.metadata.android.uses_permission]]
 name = "com.oculus.permission.WIFI_LOCK"
 [[package.metadata.android.application.meta_data]]
@@ -125,7 +131,7 @@ value = "vr_only"
 name = "com.oculus.supportedDevices"
 # Note: value is changed for the Meta store, which requires an explicit list of platforms.
 # "all" is required to support Quest 1 which doesn't have newer platform names registered.
-value = "all" 
+value = "all"
 [[package.metadata.android.application.meta_data]]
 name = "com.oculus.vr.focusaware"
 value = "true"
@@ -157,17 +163,26 @@ value = "3,6DoF"
 [[package.metadata.android.uses_permission]]
 name = "com.picovr.permission.EYE_TRACKING"
 [[package.metadata.android.application.meta_data]]
-name = "pvr.app.type"
-value = "vr"
-[[package.metadata.android.application.meta_data]]
-name = "picovr.software.eye_tracking"
-value = "true"
-[[package.metadata.android.application.meta_data]]
 name = "eyetracking_calibration"
 value = "true"
 [[package.metadata.android.application.meta_data]]
 name = "handtracking"
 value = "1"
+[[package.metadata.android.application.meta_data]]
+name = "picovr.software.eye_tracking"
+value = "1"
+[[package.metadata.android.application.meta_data]]
+name = "pvr.app.type"
+value = "vr"
+[[package.metadata.android.application.meta_data]]
+name = "pvr.display.orientation"
+value = "180"
+[[package.metadata.android.application.meta_data]]
+name = "pvr.sdk.version"
+value = "OpenXR"
+[[package.metadata.android.application.meta_data]]
+name = "pxr.sdk.version_code"
+value = "5900"
 
 # Yvr entries
 [[package.metadata.android.application.meta_data]]
@@ -175,8 +190,6 @@ name = "com.yvr.intent.category.VR"
 value = "vr_only"
 
 # Lynx entries
-[[package.metadata.android.queries.intent]]
-actions = ["org.khronos.openxr.OpenXRRuntimeService"]
 [[package.metadata.android.queries.package]]
 name = "com.ultraleap.tracking.service"
 [[package.metadata.android.queries.package]]

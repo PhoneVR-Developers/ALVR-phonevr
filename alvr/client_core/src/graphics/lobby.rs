@@ -1,6 +1,6 @@
 use super::{GraphicsContext, SDR_FORMAT};
 use alvr_common::{
-    glam::{Mat4, UVec2, Vec3, Vec4},
+    glam::{IVec2, Mat4, Quat, UVec2, Vec3, Vec4},
     Fov, Pose,
 };
 use glyph_brush_layout::{
@@ -25,6 +25,18 @@ const HUD_DIST: f32 = 5.0;
 const HUD_SIDE: f32 = 3.5;
 const HUD_TEXTURE_SIDE: usize = 1024;
 const FONT_SIZE: f32 = 50.0;
+
+const FAST_BORDER_OFFSETS: [IVec2; 8] = [
+    IVec2::new(0, -3),
+    IVec2::new(2, -2),
+    IVec2::new(3, 0),
+    IVec2::new(2, 2),
+    IVec2::new(0, 3),
+    IVec2::new(-2, 2),
+    IVec2::new(-3, 0),
+    IVec2::new(-2, -2),
+];
+const MAX_BORDER_OFFSET: i32 = 3;
 
 const HAND_SKELETON_BONES: [(usize, usize); 19] = [
     // Thumb
@@ -51,6 +63,44 @@ const HAND_SKELETON_BONES: [(usize, usize); 19] = [
     (22, 23),
     (23, 24),
     (24, 25),
+];
+
+const BODY_SKELETON_BONES_FB: [(usize, usize); 30] = [
+    // Spine
+    (1, 2),
+    (2, 3),
+    (3, 4),
+    (4, 5),
+    (5, 6),
+    (6, 7),
+    // Left arm
+    (5, 8),
+    (8, 9),
+    (9, 10),
+    (10, 11),
+    (11, 12),
+    // Right arm
+    (5, 13),
+    (13, 14),
+    (14, 15),
+    (15, 16),
+    (16, 17),
+    // Left leg
+    (1, 70),
+    (70, 71),
+    (71, 72),
+    (72, 73),
+    (73, 74),
+    (74, 75),
+    (75, 76),
+    // Right leg
+    (1, 77),
+    (77, 78),
+    (78, 79),
+    (79, 80),
+    (80, 81),
+    (81, 82),
+    (82, 83),
 ];
 
 fn projection_from_fov(fov: Fov) -> Mat4 {
@@ -272,11 +322,30 @@ impl LobbyRenderer {
         for section_glyph in section_glyphs {
             if let Some(outlined) = scaled_font.outline_glyph(section_glyph.glyph) {
                 let bounds = outlined.px_bounds();
+
                 outlined.draw(|x, y, alpha| {
-                    let x = x as usize + bounds.min.x as usize;
-                    let y = y as usize + bounds.min.y as usize;
-                    if x < HUD_TEXTURE_SIDE && y < HUD_TEXTURE_SIDE {
-                        buffer[(y * HUD_TEXTURE_SIDE + x) * 4 + 3] = (alpha * 255.0) as u8;
+                    let x = x as i32 + bounds.min.x as i32;
+                    let y = y as i32 + bounds.min.y as i32;
+
+                    if x >= MAX_BORDER_OFFSET
+                        && y >= MAX_BORDER_OFFSET
+                        && x < HUD_TEXTURE_SIDE as i32 - MAX_BORDER_OFFSET
+                        && y < HUD_TEXTURE_SIDE as i32 - MAX_BORDER_OFFSET
+                    {
+                        let coord = (y as usize * HUD_TEXTURE_SIDE + x as usize) * 4;
+                        let value = (alpha * 255.0) as u8;
+
+                        buffer[coord] = value;
+                        buffer[coord + 1] = value;
+                        buffer[coord + 2] = value;
+
+                        // Render opacity with border
+                        for offset in &FAST_BORDER_OFFSETS {
+                            let coord = ((y + offset.y) as usize * HUD_TEXTURE_SIDE
+                                + (x + offset.x) as usize)
+                                * 4;
+                            buffer[coord + 3] = u8::max(buffer[coord + 3], value);
+                        }
                     }
                 });
             }
@@ -306,7 +375,9 @@ impl LobbyRenderer {
     pub fn render(
         &self,
         view_inputs: [RenderViewInput; 2],
-        hand_poses: [(Option<Pose>, Option<[Pose; 26]>); 2],
+        hand_data: [(Option<Pose>, Option<[Pose; 26]>); 2],
+        body_skeleton_fb: Option<Vec<Option<Pose>>>,
+        render_background: bool,
     ) {
         let mut encoder = self
             .context
@@ -323,18 +394,24 @@ impl LobbyRenderer {
             .inverse();
             let view_proj = projection_from_fov(view_input.fov) * view;
 
+            let clear_color = if render_background {
+                Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.02,
+                    a: 1.0,
+                }
+            } else {
+                Color::TRANSPARENT
+            };
+
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some(&format!("lobby_view_{}", view_idx)),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &self.render_targets[view_idx][view_input.swapchain_index as usize],
                     resolve_target: None,
                     ops: Operations {
-                        load: LoadOp::Clear(Color {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.02,
-                            a: 1.0,
-                        }),
+                        load: LoadOp::Clear(clear_color),
                         store: StoreOp::Store,
                     },
                 })],
@@ -357,13 +434,19 @@ impl LobbyRenderer {
             pass.set_pipeline(&self.quad_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
 
-            // Render ground
-            pass.set_push_constants(ShaderStages::VERTEX_FRAGMENT, 64, &0_u32.to_le_bytes());
-            pass.set_push_constants(ShaderStages::VERTEX_FRAGMENT, 68, &FLOOR_SIDE.to_le_bytes());
-            let transform = view_proj
-                * Mat4::from_rotation_x(-FRAC_PI_2)
-                * Mat4::from_scale(Vec3::ONE * FLOOR_SIDE);
-            transform_draw(&mut pass, transform, 4);
+            if render_background {
+                // Render ground
+                pass.set_push_constants(ShaderStages::VERTEX_FRAGMENT, 64, &0_u32.to_le_bytes());
+                pass.set_push_constants(
+                    ShaderStages::VERTEX_FRAGMENT,
+                    68,
+                    &FLOOR_SIDE.to_le_bytes(),
+                );
+                let transform = view_proj
+                    * Mat4::from_rotation_x(-FRAC_PI_2)
+                    * Mat4::from_scale(Vec3::ONE * FLOOR_SIDE);
+                transform_draw(&mut pass, transform, 4);
+            }
 
             // Render HUD
             pass.set_push_constants(ShaderStages::VERTEX_FRAGMENT, 64, &1_u32.to_le_bytes());
@@ -374,9 +457,9 @@ impl LobbyRenderer {
                 transform_draw(&mut pass, view_proj * transform, 4);
             }
 
-            // Bind line pipeline and render hands
+            // Render hands and body skeleton
             pass.set_pipeline(&self.line_pipeline);
-            for (maybe_pose, maybe_skeleton) in &hand_poses {
+            for (maybe_pose, maybe_skeleton) in &hand_data {
                 if let Some(skeleton) = maybe_skeleton {
                     for (joint1_idx, joint2_idx) in HAND_SKELETON_BONES {
                         let j1_pose = skeleton[joint1_idx];
@@ -389,7 +472,9 @@ impl LobbyRenderer {
                         );
                         transform_draw(&mut pass, view_proj * transform, 2);
                     }
-                } else if let Some(pose) = maybe_pose {
+                }
+
+                if let Some(pose) = maybe_pose {
                     let hand_transform = Mat4::from_scale_rotation_translation(
                         Vec3::ONE * 0.2,
                         pose.orientation,
@@ -406,6 +491,23 @@ impl LobbyRenderer {
                             * *rot
                             * Mat4::from_scale(Vec3::ONE * 0.5)
                             * Mat4::from_translation(Vec3::Z * 0.5);
+                        transform_draw(&mut pass, view_proj * transform, 2);
+                    }
+                }
+            }
+            if let Some(skeleton) = &body_skeleton_fb {
+                for (joint1_idx, joint2_idx) in BODY_SKELETON_BONES_FB {
+                    if let (Some(Some(j1_pose)), Some(Some(j2_pose))) =
+                        (skeleton.get(joint1_idx), skeleton.get(joint2_idx))
+                    {
+                        let transform = Mat4::from_scale_rotation_translation(
+                            Vec3::ONE * Vec3::distance(j1_pose.position, j2_pose.position),
+                            Quat::from_rotation_arc(
+                                -Vec3::Z,
+                                (j2_pose.position - j1_pose.position).normalize(),
+                            ),
+                            j1_pose.position,
+                        );
                         transform_draw(&mut pass, view_proj * transform, 2);
                     }
                 }

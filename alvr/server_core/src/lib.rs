@@ -1,8 +1,6 @@
 mod bitrate;
-mod body_tracking;
 mod c_api;
 mod connection;
-mod face_tracking;
 mod hand_gestures;
 mod haptics;
 mod input_mapping;
@@ -14,7 +12,7 @@ mod web_server;
 
 pub use c_api::*;
 pub use logging_backend::init_logging;
-pub use tracking::get_hand_skeleton_offsets;
+pub use tracking::HandType;
 
 use crate::connection::VideoPacket;
 use alvr_common::{
@@ -23,12 +21,13 @@ use alvr_common::{
     once_cell::sync::Lazy,
     parking_lot::{Mutex, RwLock},
     settings_schema::Switch,
-    warn, ConnectionState, Fov, LifecycleState, Pose, RelaxedAtomic, DEVICE_ID_TO_PATH,
+    warn, ConnectionState, DeviceMotion, Fov, LifecycleState, Pose, RelaxedAtomic,
+    DEVICE_ID_TO_PATH,
 };
 use alvr_events::{EventType, HapticsEvent};
 use alvr_filesystem as afs;
 use alvr_packets::{
-    BatteryInfo, ButtonEntry, ClientListAction, DecoderInitializationConfig, Haptics, Tracking,
+    BatteryInfo, ButtonEntry, ClientListAction, DecoderInitializationConfig, Haptics,
     VideoPacketHeader,
 };
 use alvr_server_io::ServerSessionManager;
@@ -39,6 +38,7 @@ use statistics::StatisticsManager;
 use std::{
     collections::HashSet,
     env,
+    ffi::OsStr,
     fs::File,
     io::Write,
     sync::{
@@ -49,8 +49,9 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use sysinfo::{ProcessRefreshKind, RefreshKind};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind};
 use tokio::{runtime::Runtime, sync::broadcast};
+use tracking::TrackingManager;
 
 static FILESYSTEM_LAYOUT: OnceLock<afs::Layout> = OnceLock::new();
 
@@ -86,8 +87,7 @@ pub enum ServerCoreEvent {
     PlayspaceSync(Vec2),
     ViewsConfig(ViewsConfig),
     Tracking {
-        tracking: Box<Tracking>,
-        controllers_pose_time_offset: Duration,
+        sample_timestamp: Duration,
     },
     Buttons(Vec<ButtonEntry>), // Note: this is after mapping
     RequestIDR,
@@ -99,8 +99,9 @@ pub enum ServerCoreEvent {
 
 pub struct ConnectionContext {
     events_sender: mpsc::Sender<ServerCoreEvent>,
-    statistics_manager: Mutex<Option<StatisticsManager>>,
+    statistics_manager: RwLock<Option<StatisticsManager>>,
     bitrate_manager: Mutex<BitrateManager>,
+    tracking_manager: RwLock<TrackingManager>,
     decoder_config: Mutex<Option<DecoderInitializationConfig>>,
     video_mirror_sender: Mutex<Option<broadcast::Sender<Vec<u8>>>>,
     video_recording_file: Mutex<Option<File>>,
@@ -146,10 +147,10 @@ pub fn notify_restart_driver() {
     let mut system = sysinfo::System::new_with_specifics(
         RefreshKind::new().with_processes(ProcessRefreshKind::everything()),
     );
-    system.refresh_processes();
+    system.refresh_processes(ProcessesToUpdate::All);
 
     if system
-        .processes_by_name(afs::dashboard_fname())
+        .processes_by_name(OsStr::new(&afs::dashboard_fname()))
         .next()
         .is_some()
     {
@@ -198,10 +199,23 @@ impl ServerCoreContext {
 
         let (events_sender, events_receiver) = mpsc::channel();
 
+        // Create a temporary StatisticsManager until a headset connects
+        let initial_settings = SESSION_MANAGER.read().settings().clone();
+        let stats = StatisticsManager::new(
+            initial_settings.connection.statistics_history_size,
+            Duration::from_secs_f32(1.0 / 90.0),
+            if let Switch::Enabled(config) = &initial_settings.headset.controllers {
+                config.steamvr_pipeline_frames
+            } else {
+                0.0
+            },
+        );
+
         let connection_context = Arc::new(ConnectionContext {
             events_sender,
-            statistics_manager: Mutex::new(None),
+            statistics_manager: RwLock::new(Some(stats)),
             bitrate_manager: Mutex::new(BitrateManager::new(256, 60.0)),
+            tracking_manager: RwLock::new(TrackingManager::new()),
             decoder_config: Mutex::new(None),
             video_mirror_sender: Mutex::new(None),
             video_recording_file: Mutex::new(None),
@@ -241,6 +255,57 @@ impl ServerCoreContext {
         *self.connection_thread.write() = Some(thread::spawn(move || {
             connection::handshake_loop(connection_context, lifecycle_state);
         }));
+    }
+
+    pub fn get_device_motion(
+        &self,
+        device_id: u64,
+        sample_timestamp: Duration,
+    ) -> Option<DeviceMotion> {
+        dbg_server_core!("get_device_motion: dev={device_id} sample_ts={sample_timestamp:?}");
+
+        self.connection_context
+            .tracking_manager
+            .read()
+            .get_device_motion(device_id, sample_timestamp)
+    }
+
+    pub fn get_hand_skeleton(
+        &self,
+        hand_type: HandType,
+        timestamp: Duration,
+    ) -> Option<[Pose; 26]> {
+        dbg_server_core!("get_hand_skeleton: hand={hand_type:?} ts={timestamp:?}");
+
+        self.connection_context
+            .tracking_manager
+            .read()
+            .get_hand_skeleton(hand_type, timestamp)
+            .copied()
+    }
+
+    pub fn get_motion_to_photon_latency(&self) -> Duration {
+        dbg_server_core!("get_total_pipeline_latency");
+
+        // self.connection_context
+        //     .statistics_manager
+        //     .read()
+        //     .as_ref()
+        //     .map(|stats| stats.motion_to_photon_latency_average())
+        //     .unwrap_or_default()
+
+        Duration::from_millis(0)
+    }
+
+    pub fn get_tracker_pose_time_offset(&self) -> Duration {
+        dbg_server_core!("get_tracker_pose_time_offset");
+
+        self.connection_context
+            .statistics_manager
+            .read()
+            .as_ref()
+            .map(|stats| stats.tracker_pose_time_offset())
+            .unwrap_or_default()
     }
 
     pub fn send_haptics(&self, haptics: Haptics) {
@@ -371,7 +436,7 @@ impl ServerCoreContext {
                 warn!("Dropping video packet. Reason: Waiting for IDR frame");
             }
 
-            if let Some(stats) = &mut *self.connection_context.statistics_manager.lock() {
+            if let Some(stats) = &mut *self.connection_context.statistics_manager.write() {
                 let encoder_latency = stats.report_frame_encoded(target_timestamp, buffer_size);
 
                 self.connection_context
@@ -394,8 +459,8 @@ impl ServerCoreContext {
         };
 
         if let Some((params, stats)) = pair {
-            if let Some(stats_manager) = &mut *self.connection_context.statistics_manager.lock() {
-                stats_manager.report_nominal_bitrate_stats(stats);
+            if let Some(stats_manager) = &mut *self.connection_context.statistics_manager.write() {
+                stats_manager.report_throughput_stats(stats);
             }
 
             Some(params)
@@ -407,7 +472,7 @@ impl ServerCoreContext {
     pub fn report_composed(&self, target_timestamp: Duration, offset: Duration) {
         dbg_server_core!("report_composed");
 
-        if let Some(stats) = &mut *self.connection_context.statistics_manager.lock() {
+        if let Some(stats) = &mut *self.connection_context.statistics_manager.write() {
             stats.report_frame_composed(target_timestamp, offset);
         }
     }
@@ -415,7 +480,7 @@ impl ServerCoreContext {
     pub fn report_present(&self, target_timestamp: Duration, offset: Duration) {
         dbg_server_core!("report_present");
 
-        if let Some(stats) = &mut *self.connection_context.statistics_manager.lock() {
+        if let Some(stats) = &mut *self.connection_context.statistics_manager.write() {
             stats.report_frame_present(target_timestamp, offset);
         }
 
@@ -437,7 +502,7 @@ impl ServerCoreContext {
 
         self.connection_context
             .statistics_manager
-            .lock()
+            .write()
             .as_mut()
             .map(|stats| stats.duration_until_next_vsync())
     }

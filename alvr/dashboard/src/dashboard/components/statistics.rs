@@ -84,6 +84,11 @@ impl StatisticsTab {
 
             let painter = ui.painter().with_clip_rect(canvas_rect);
 
+            if max == min {
+                // Drawing using a 0 sized rectangle causes a crash
+                return data_rect;
+            }
+
             graph_content(&painter, to_screen);
 
             ui.painter().text(
@@ -163,7 +168,7 @@ impl StatisticsTab {
                 Grid::new("latency_tooltip").num_columns(2).show(ui, |ui| {
                     fn label(ui: &mut Ui, text: &str, value_s: f32, color: Color32) {
                         ui.colored_label(color, text);
-                        ui.colored_label(color, &format!("{:.2}ms", value_s * 1000.0));
+                        ui.colored_label(color, format!("{:.2}ms", value_s * 1000.0));
                         ui.end_row();
                     }
 
@@ -243,14 +248,16 @@ impl StatisticsTab {
                 draw_lines(painter, client_fps_points, graph_colors::CLIENT_FPS);
             },
             |ui, stats| {
-                ui.colored_label(
-                    graph_colors::SERVER_FPS,
-                    format!("Streamer FPS: {:.2}", stats.server_fps),
-                );
-                ui.colored_label(
-                    graph_colors::CLIENT_FPS,
-                    format!("Client FPS: {:.2}", stats.client_fps),
-                );
+                Grid::new("fps_tooltip").num_columns(2).show(ui, |ui| {
+                    fn label(ui: &mut Ui, text: &str, value: f32, color: Color32) {
+                        ui.colored_label(color, text);
+                        ui.colored_label(color, format!("{:.2}Hz", value));
+                        ui.end_row();
+                    }
+
+                    label(ui, "Server FPS", stats.server_fps, graph_colors::SERVER_FPS);
+                    label(ui, "Client FPS", stats.client_fps, graph_colors::CLIENT_FPS);
+                });
             },
         );
     }
@@ -259,107 +266,168 @@ impl StatisticsTab {
         let mut data = statistics::Data::new(
             self.history
                 .iter()
-                .map(|stats| stats.actual_bitrate_bps as f64)
+                .map(|stats| stats.throughput_bps as f64)
                 .collect::<Vec<_>>(),
         );
 
         self.draw_graph(
             ui,
             available_width,
-            "Bitrate",
-            0.0..=(data.quantile(UPPER_QUANTILE) * 2.0) as f32 / 1e6,
+            "Bitrate and Throughput",
+            0.0..=(data.quantile(UPPER_QUANTILE) * 1.2) as f32 / 1e6,
             |painter, to_screen_trans| {
                 let mut scaled_calculated = Vec::with_capacity(GRAPH_HISTORY_SIZE);
                 let mut decoder_latency_limiter = Vec::with_capacity(GRAPH_HISTORY_SIZE);
                 let mut network_latency_limiter = Vec::with_capacity(GRAPH_HISTORY_SIZE);
                 let mut encoder_latency_limiter = Vec::with_capacity(GRAPH_HISTORY_SIZE);
-                let mut manual_max = Vec::with_capacity(GRAPH_HISTORY_SIZE);
-                let mut manual_min = Vec::with_capacity(GRAPH_HISTORY_SIZE);
-                let mut requested = Vec::with_capacity(GRAPH_HISTORY_SIZE);
-                let mut actual = Vec::with_capacity(GRAPH_HISTORY_SIZE);
+                let mut max_throughput = Vec::with_capacity(GRAPH_HISTORY_SIZE);
+                let mut min_throughput = Vec::with_capacity(GRAPH_HISTORY_SIZE);
+                let mut requested_bitrate = Vec::with_capacity(GRAPH_HISTORY_SIZE);
+                let mut recorded_throughput = Vec::with_capacity(GRAPH_HISTORY_SIZE);
+                let mut recorded_bitrate = Vec::with_capacity(GRAPH_HISTORY_SIZE);
                 for i in 0..GRAPH_HISTORY_SIZE {
-                    let nom_br = &self.history[i].nominal_bitrate;
+                    let d = &self.history[i].bitrate_directives;
 
-                    if let Some(value) = nom_br.scaled_calculated_bps {
+                    if let Some(value) = d.scaled_calculated_throughput_bps {
                         scaled_calculated.push(to_screen_trans * pos2(i as f32, value / 1e6))
                     }
-                    if let Some(value) = nom_br.decoder_latency_limiter_bps {
+                    if let Some(value) = d.decoder_latency_limiter_bps {
                         decoder_latency_limiter.push(to_screen_trans * pos2(i as f32, value / 1e6))
                     }
-                    if let Some(value) = nom_br.network_latency_limiter_bps {
+                    if let Some(value) = d.network_latency_limiter_bps {
                         network_latency_limiter.push(to_screen_trans * pos2(i as f32, value / 1e6))
                     }
-                    if let Some(value) = nom_br.encoder_latency_limiter_bps {
+                    if let Some(value) = d.encoder_latency_limiter_bps {
                         encoder_latency_limiter.push(to_screen_trans * pos2(i as f32, value / 1e6))
                     }
-                    if let Some(value) = nom_br.manual_max_bps {
-                        manual_max.push(to_screen_trans * pos2(i as f32, value / 1e6))
+                    if let Some(value) = d.manual_max_throughput_bps {
+                        max_throughput.push(to_screen_trans * pos2(i as f32, value / 1e6))
                     }
-                    if let Some(value) = nom_br.manual_min_bps {
-                        manual_min.push(to_screen_trans * pos2(i as f32, value / 1e6))
+                    if let Some(value) = d.manual_min_throughput_bps {
+                        min_throughput.push(to_screen_trans * pos2(i as f32, value / 1e6))
                     }
-                    requested.push(to_screen_trans * pos2(i as f32, nom_br.requested_bps / 1e6));
-                    actual.push(
-                        to_screen_trans * pos2(i as f32, self.history[i].actual_bitrate_bps / 1e6),
+                    requested_bitrate
+                        .push(to_screen_trans * pos2(i as f32, d.requested_bitrate_bps / 1e6));
+                    recorded_throughput.push(
+                        to_screen_trans * pos2(i as f32, self.history[i].throughput_bps / 1e6),
                     );
+                    recorded_bitrate
+                        .push(to_screen_trans * pos2(i as f32, self.history[i].bitrate_bps / 1e6));
                 }
 
-                draw_lines(painter, scaled_calculated, Color32::GRAY);
-                draw_lines(painter, encoder_latency_limiter, graph_colors::TRANSCODE);
-                draw_lines(painter, network_latency_limiter, graph_colors::NETWORK);
-                draw_lines(painter, decoder_latency_limiter, graph_colors::TRANSCODE);
-                draw_lines(painter, manual_max, graph_colors::RENDER);
-                draw_lines(painter, manual_min, graph_colors::RENDER);
-                draw_lines(painter, requested, theme::OK_GREEN);
-                draw_lines(painter, actual, theme::FG);
+                draw_lines(
+                    painter,
+                    scaled_calculated,
+                    graph_colors::INITIAL_CALCULATED_THROUGHPUT,
+                );
+                draw_lines(
+                    painter,
+                    encoder_latency_limiter,
+                    graph_colors::ENCODER_DECODER_LATENCY_LIMITER,
+                );
+                draw_lines(
+                    painter,
+                    network_latency_limiter,
+                    graph_colors::NETWORK_LATENCY_LIMITER,
+                );
+                draw_lines(
+                    painter,
+                    decoder_latency_limiter,
+                    graph_colors::ENCODER_DECODER_LATENCY_LIMITER,
+                );
+                draw_lines(
+                    painter,
+                    max_throughput,
+                    graph_colors::MIN_MAX_LATENCY_THROUGHPUT,
+                );
+                draw_lines(
+                    painter,
+                    min_throughput,
+                    graph_colors::MIN_MAX_LATENCY_THROUGHPUT,
+                );
+                draw_lines(painter, requested_bitrate, graph_colors::REQUESTED_BITRATE);
+                draw_lines(
+                    painter,
+                    recorded_throughput,
+                    graph_colors::RECORDED_THROUGHPUT,
+                );
+                draw_lines(painter, recorded_bitrate, theme::FG);
             },
             |ui, stats| {
-                fn maybe_label(
-                    ui: &mut Ui,
-                    text: &str,
-                    maybe_value_bps: Option<f32>,
-                    color: Color32,
-                ) {
-                    if let Some(value) = maybe_value_bps {
-                        ui.colored_label(color, &format!("{text}: {:.2} Mbps", value / 1e6));
+                Grid::new("bitrate_tooltip").num_columns(2).show(ui, |ui| {
+                    fn maybe_label(
+                        ui: &mut Ui,
+                        text: &str,
+                        maybe_value_bps: Option<f32>,
+                        color: Color32,
+                    ) {
+                        if let Some(value) = maybe_value_bps {
+                            ui.colored_label(color, text);
+                            ui.colored_label(color, format!("{:.2} Mbps", value / 1e6));
+                            ui.end_row();
+                        }
                     }
-                }
 
-                let n = &stats.nominal_bitrate;
+                    let td = &stats.bitrate_directives;
 
-                maybe_label(
-                    ui,
-                    "Initial calculated",
-                    n.scaled_calculated_bps,
-                    Color32::GRAY,
-                );
-                maybe_label(
-                    ui,
-                    "Encoder latency limiter",
-                    n.encoder_latency_limiter_bps,
-                    graph_colors::TRANSCODE,
-                );
-                maybe_label(
-                    ui,
-                    "Network latency limiter",
-                    n.network_latency_limiter_bps,
-                    graph_colors::NETWORK,
-                );
-                maybe_label(
-                    ui,
-                    "Decoder latency limiter",
-                    n.decoder_latency_limiter_bps,
-                    graph_colors::TRANSCODE,
-                );
-                maybe_label(ui, "Manual max", n.manual_max_bps, graph_colors::RENDER);
-                maybe_label(ui, "Manual min", n.manual_min_bps, graph_colors::RENDER);
-                maybe_label(ui, "Requested", Some(n.requested_bps), theme::OK_GREEN);
-                maybe_label(
-                    ui,
-                    "Actual recorded",
-                    Some(stats.actual_bitrate_bps),
-                    theme::FG,
-                );
+                    maybe_label(
+                        ui,
+                        "Initial calculated throughput",
+                        td.scaled_calculated_throughput_bps,
+                        graph_colors::INITIAL_CALCULATED_THROUGHPUT,
+                    );
+                    maybe_label(
+                        ui,
+                        "Encoder latency limiter",
+                        td.encoder_latency_limiter_bps,
+                        graph_colors::ENCODER_DECODER_LATENCY_LIMITER,
+                    );
+                    maybe_label(
+                        ui,
+                        "Network latency limiter",
+                        td.network_latency_limiter_bps,
+                        graph_colors::NETWORK_LATENCY_LIMITER,
+                    );
+                    maybe_label(
+                        ui,
+                        "Decoder latency limiter",
+                        td.decoder_latency_limiter_bps
+                            .filter(|l| *l < stats.throughput_bps),
+                        graph_colors::ENCODER_DECODER_LATENCY_LIMITER,
+                    );
+                    maybe_label(
+                        ui,
+                        "Manual max throughput",
+                        td.manual_max_throughput_bps,
+                        graph_colors::MIN_MAX_LATENCY_THROUGHPUT,
+                    );
+                    maybe_label(
+                        ui,
+                        "Manual min throughput",
+                        td.manual_min_throughput_bps,
+                        graph_colors::MIN_MAX_LATENCY_THROUGHPUT,
+                    );
+                    maybe_label(
+                        ui,
+                        "Requested bitrate",
+                        Some(td.requested_bitrate_bps),
+                        graph_colors::REQUESTED_BITRATE,
+                    );
+                    maybe_label(
+                        ui,
+                        "Recorded throughput",
+                        Some(stats.throughput_bps),
+                        graph_colors::RECORDED_THROUGHPUT,
+                    );
+                    maybe_label(
+                        ui,
+                        "Recorded bitrate",
+                        Some(stats.bitrate_bps),
+                        graph_colors::RECORDED_BITRATE,
+                    );
+                });
+
+                ui.small("Note: throughput is the peak bitrate, packet_size/network_latency.");
             },
         )
     }
@@ -369,43 +437,43 @@ impl StatisticsTab {
 
         ui.columns(2, |ui| {
             ui[0].label("Total packets:");
-            ui[1].label(&format!(
+            ui[1].label(format!(
                 "{} packets ({} packets/s)",
                 statistics.video_packets_total, statistics.video_packets_per_sec
             ));
 
             ui[0].label("Total sent:");
-            ui[1].label(&format!("{} MB", statistics.video_mbytes_total));
+            ui[1].label(format!("{} MB", statistics.video_mbytes_total));
 
             ui[0].label("Bitrate:");
-            ui[1].label(&format!("{:.1} Mbps", statistics.video_mbits_per_sec));
+            ui[1].label(format!("{:.1} Mbps", statistics.video_mbits_per_sec));
 
             ui[0].label("Total latency:");
-            ui[1].label(&format!("{:.0} ms", statistics.total_latency_ms));
+            ui[1].label(format!("{:.0} ms", statistics.total_latency_ms));
 
             ui[0].label("Encoder latency:");
-            ui[1].label(&format!("{:.2} ms", statistics.encode_latency_ms));
+            ui[1].label(format!("{:.2} ms", statistics.encode_latency_ms));
 
             ui[0].label("Transport latency:");
-            ui[1].label(&format!("{:.2} ms", statistics.network_latency_ms));
+            ui[1].label(format!("{:.2} ms", statistics.network_latency_ms));
 
             ui[0].label("Decoder latency:");
-            ui[1].label(&format!("{:.2} ms", statistics.decode_latency_ms));
+            ui[1].label(format!("{:.2} ms", statistics.decode_latency_ms));
 
             ui[0].label("Total packets lost:");
-            ui[1].label(&format!(
+            ui[1].label(format!(
                 "{} packets ({} packets/s)",
                 statistics.packets_lost_total, statistics.packets_lost_per_sec
             ));
 
             ui[0].label("Client FPS:");
-            ui[1].label(&format!("{} FPS", statistics.client_fps));
+            ui[1].label(format!("{} FPS", statistics.client_fps));
 
             ui[0].label("Streamer FPS:");
-            ui[1].label(&format!("{} FPS", statistics.server_fps));
+            ui[1].label(format!("{} FPS", statistics.server_fps));
 
             ui[0].label("Headset battery");
-            ui[1].label(&format!(
+            ui[1].label(format!(
                 "{}% ({})",
                 statistics.battery_hmd,
                 if statistics.hmd_plugged {

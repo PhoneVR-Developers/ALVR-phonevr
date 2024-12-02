@@ -1,9 +1,7 @@
 #![allow(clippy::if_same_then_else)]
 
 use crate::{
-    decoder::{self, DecoderConfig, DecoderSink, DecoderSource},
     logging_backend::{LogMirrorData, LOG_CHANNEL_SENDER},
-    platform,
     sockets::AnnouncerSocket,
     statistics::StatisticsManager,
     storage::Config,
@@ -14,14 +12,14 @@ use alvr_common::{
     dbg_connection, debug, error, info,
     parking_lot::{Condvar, Mutex, RwLock},
     wait_rwlock, warn, AnyhowToCon, ConResult, ConnectionError, ConnectionState, LifecycleState,
-    ALVR_VERSION,
+    Pose, RelaxedAtomic, ALVR_VERSION,
 };
 use alvr_packets::{
     ClientConnectionResult, ClientControlPacket, ClientStatistics, Haptics, ServerControlPacket,
     StreamConfigPacket, Tracking, VideoPacketHeader, VideoStreamingCapabilities, ViewParams, AUDIO,
     HAPTICS, STATISTICS, TRACKING, VIDEO,
 };
-use alvr_session::settings_schema::Switch;
+use alvr_session::{settings_schema::Switch, SocketProtocol};
 use alvr_sockets::{
     ControlSocketSender, PeerType, ProtoControlSocket, StreamSender, StreamSocketBuilder,
     KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT,
@@ -64,11 +62,11 @@ pub struct ConnectionContext {
     pub tracking_sender: Mutex<Option<StreamSender<Tracking>>>,
     pub statistics_sender: Mutex<Option<StreamSender<ClientStatistics>>>,
     pub statistics_manager: Mutex<Option<StatisticsManager>>,
-    pub decoder_sink: Mutex<Option<DecoderSink>>,
-    pub decoder_source: Mutex<Option<DecoderSource>>,
-    // todo: the server is supposed to receive and send view configs for each frame
-    pub view_params_queue: RwLock<VecDeque<(Duration, [ViewParams; 2])>>,
-    pub last_good_view_params: RwLock<[ViewParams; 2]>,
+    pub decoder_callback: Mutex<Option<Box<dyn FnMut(Duration, &[u8]) -> bool + Send>>>,
+    pub head_pose_queue: RwLock<VecDeque<(Duration, Pose)>>,
+    pub last_good_head_pose: RwLock<Pose>,
+    pub view_params: RwLock<[ViewParams; 2]>,
+    pub uses_multimodal_protocol: RelaxedAtomic,
 }
 
 fn set_hud_message(event_queue: &Mutex<VecDeque<ClientCoreEvent>>, message: &str) {
@@ -76,7 +74,7 @@ fn set_hud_message(event_queue: &Mutex<VecDeque<ClientCoreEvent>>, message: &str
         "ALVR v{}\nhostname: {}\nIP: {}\n\n{message}",
         *ALVR_VERSION,
         Config::load().hostname,
-        platform::local_ip(),
+        alvr_system_info::local_ip(),
     );
 
     event_queue
@@ -168,7 +166,7 @@ fn connection_pipeline(
     proto_control_socket
         .send(&ClientConnectionResult::ConnectionAccepted {
             client_protocol_id: alvr_common::protocol_id_u64(),
-            display_name: platform::platform().to_string(),
+            display_name: alvr_system_info::platform().to_string(),
             server_ip,
             streaming_capabilities: Some(
                 alvr_packets::encode_video_streaming_capabilities(&VideoStreamingCapabilities {
@@ -179,6 +177,11 @@ fn connection_pipeline(
                     encoder_high_profile: capabilities.encoder_high_profile,
                     encoder_10_bits: capabilities.encoder_10_bits,
                     encoder_av1: capabilities.encoder_av1,
+                    multimodal_protocol: true,
+                    prefer_10bit: capabilities.prefer_10bit,
+                    prefer_full_range: capabilities.prefer_full_range,
+                    preferred_encoding_gamma: capabilities.preferred_encoding_gamma,
+                    prefer_hdr: capabilities.prefer_hdr,
                 })
                 .to_con()?,
             ),
@@ -188,13 +191,15 @@ fn connection_pipeline(
         proto_control_socket.recv::<StreamConfigPacket>(HANDSHAKE_ACTION_TIMEOUT)?;
     dbg_connection!("connection_pipeline: stream config received");
 
-    let (settings, negotiated_config) =
-        alvr_packets::decode_stream_config(&config_packet).to_con()?;
+    let stream_config = alvr_packets::decode_stream_config(&config_packet).to_con()?;
 
-    let streaming_start_event = ClientCoreEvent::StreamingStarted {
-        settings: Box::new(settings.clone()),
-        negotiated_config: negotiated_config.clone(),
-    };
+    ctx.uses_multimodal_protocol
+        .set(stream_config.negotiated_config.use_multimodal_protocol);
+
+    let streaming_start_event = ClientCoreEvent::StreamingStarted(Box::new(stream_config.clone()));
+
+    let settings = stream_config.settings;
+    let negotiated_config = stream_config.negotiated_config;
 
     *ctx.statistics_manager.lock() = Some(StatisticsManager::new(
         settings.connection.statistics_history_size,
@@ -232,11 +237,17 @@ fn connection_pipeline(
         }
     }
 
+    let stream_protocol = if negotiated_config.wired {
+        SocketProtocol::Tcp
+    } else {
+        settings.connection.stream_protocol
+    };
+
     dbg_connection!("connection_pipeline: create StreamSocket");
     let stream_socket_builder = StreamSocketBuilder::listen_for_server(
         Duration::from_secs(1),
         settings.connection.stream_port,
-        settings.connection.stream_protocol,
+        stream_protocol,
         settings.connection.dscp,
         settings.connection.client_send_buffer_bytes,
         settings.connection.client_recv_buffer_bytes,
@@ -270,9 +281,8 @@ fn connection_pipeline(
 
     let video_receive_thread = thread::spawn({
         let ctx = Arc::clone(&ctx);
-        let event_queue = Arc::clone(&event_queue);
         move || {
-            let mut stream_corrupted = false;
+            let mut stream_corrupted = true;
             while is_streaming(&ctx) {
                 let data = match video_receiver.recv(STREAMING_RECV_TIMEOUT) {
                     Ok(data) => data,
@@ -298,26 +308,14 @@ fn connection_pipeline(
                 }
 
                 if !stream_corrupted || !settings.connection.avoid_video_glitching {
-                    if capabilities.external_decoder {
-                        let mut view_params = *ctx.last_good_view_params.read();
-                        for (timestamp, views) in &*ctx.view_params_queue.read() {
-                            if *timestamp == header.timestamp {
-                                view_params = *views;
-                                break;
-                            }
-                        }
-                        event_queue.lock().push_back(ClientCoreEvent::FrameReady {
-                            timestamp: header.timestamp,
-                            view_params,
-                            nal: nal.to_vec(),
-                        });
-                    } else if !ctx
-                        .decoder_sink
+                    let submitted = ctx
+                        .decoder_callback
                         .lock()
                         .as_mut()
-                        .map(|sink| sink.push_nal(header.timestamp, nal))
-                        .unwrap_or(false)
-                    {
+                        .map(|callback| callback(header.timestamp, nal))
+                        .unwrap_or(false);
+
+                    if !submitted {
                         stream_corrupted = true;
                         if let Some(sender) = &mut *ctx.control_sender.lock() {
                             sender.send(&ClientControlPacket::RequestIdr).ok();
@@ -445,7 +443,7 @@ fn connection_pipeline(
 
                 #[cfg(target_os = "android")]
                 if Instant::now() > battery_deadline {
-                    let (gauge_value, is_plugged) = platform::get_battery_status();
+                    let (gauge_value, is_plugged) = alvr_system_info::get_battery_status();
                     if let Some(sender) = &mut *ctx.control_sender.lock() {
                         sender
                             .send(&ClientControlPacket::Battery(crate::BatteryInfo {
@@ -475,39 +473,12 @@ fn connection_pipeline(
 
                 match maybe_packet {
                     Ok(ServerControlPacket::DecoderConfig(config)) => {
-                        if capabilities.external_decoder {
-                            event_queue
-                                .lock()
-                                .push_back(ClientCoreEvent::DecoderConfig {
-                                    codec: config.codec,
-                                    config_nal: config.config_buffer,
-                                });
-                        } else if ctx.decoder_sink.lock().is_none() {
-                            let config = DecoderConfig {
+                        event_queue
+                            .lock()
+                            .push_back(ClientCoreEvent::DecoderConfig {
                                 codec: config.codec,
-                                force_software_decoder: settings.video.force_software_decoder,
-                                max_buffering_frames: settings.video.max_buffering_frames,
-                                buffering_history_weight: settings.video.buffering_history_weight,
-                                options: settings.video.mediacodec_extra_options.clone(),
-                                config_buffer: config.config_buffer,
-                            };
-
-                            let (sink, source) = decoder::create_decoder(config, {
-                                let ctx = Arc::clone(&ctx);
-                                move |target_timestamp| {
-                                    if let Some(stats) = &mut *ctx.statistics_manager.lock() {
-                                        stats.report_frame_decoded(target_timestamp);
-                                    }
-                                }
+                                config_nal: config.config_buffer,
                             });
-
-                            *ctx.decoder_sink.lock() = Some(sink);
-                            *ctx.decoder_source.lock() = Some(source);
-
-                            if let Some(sender) = &mut *ctx.control_sender.lock() {
-                                sender.send(&ClientControlPacket::RequestIdr).ok();
-                            }
-                        }
                     }
                     Ok(ServerControlPacket::Restarting) => {
                         info!("{SERVER_RESTART_MESSAGE}");
@@ -571,10 +542,6 @@ fn connection_pipeline(
 
     dbg_connection!("connection_pipeline: Unlock streams");
 
-    // Make sure IPD and FoV are resent after reconnection
-    // todo: send this data as part of the connection handshake
-    ctx.view_params_queue.write().clear();
-
     // Unlock CONNECTION_STATE and block thread
     wait_rwlock(&disconnect_notif, &mut connection_state_lock);
 
@@ -588,9 +555,6 @@ fn connection_pipeline(
     event_queue
         .lock()
         .push_back(ClientCoreEvent::StreamingStopped);
-
-    *ctx.decoder_sink.lock() = None;
-    *ctx.decoder_source.lock() = None;
 
     // Remove lock to allow threads to properly exit:
     drop(connection_state_lock);

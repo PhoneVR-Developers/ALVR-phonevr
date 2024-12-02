@@ -1,8 +1,11 @@
 use crate::{
     graphics::{GraphicsContext, LobbyRenderer, RenderViewInput, StreamRenderer},
-    storage, ClientCapabilities, ClientCoreContext, ClientCoreEvent,
+    storage,
+    video_decoder::{self, VideoDecoderConfig, VideoDecoderSource},
+    ClientCapabilities, ClientCoreContext, ClientCoreEvent,
 };
 use alvr_common::{
+    anyhow::Result,
     debug, error,
     glam::{Quat, UVec2, Vec2, Vec3},
     info,
@@ -11,10 +14,9 @@ use alvr_common::{
     warn, DeviceMotion, Fov, OptLazy, Pose,
 };
 use alvr_packets::{ButtonEntry, ButtonValue, FaceData, ViewParams};
-use alvr_session::{CodecType, FoveatedEncodingConfig};
+use alvr_session::{CodecType, FoveatedEncodingConfig, MediacodecPropType, MediacodecProperty};
 use std::{
     cell::RefCell,
-    collections::VecDeque,
     ffi::{c_char, c_void, CStr, CString},
     ptr,
     rc::Rc,
@@ -25,9 +27,8 @@ use std::{
 static CLIENT_CORE_CONTEXT: OptLazy<ClientCoreContext> = alvr_common::lazy_mut_none();
 static HUD_MESSAGE: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new("".into()));
 static SETTINGS: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new("".into()));
-#[allow(clippy::type_complexity)]
-static NAL_QUEUE: Lazy<Mutex<VecDeque<(u64, [ViewParams; 2], Vec<u8>)>>> =
-    Lazy::new(|| Mutex::new(VecDeque::new()));
+static SERVER_VERSION: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new("".into()));
+static DECODER_CONFIG_BUFFER: Lazy<Mutex<Vec<u8>>> = Lazy::new(|| Mutex::new("".into()));
 
 // Core interface:
 
@@ -35,13 +36,16 @@ static NAL_QUEUE: Lazy<Mutex<VecDeque<(u64, [ViewParams; 2], Vec<u8>)>>> =
 pub struct AlvrClientCapabilities {
     default_view_width: u32,
     default_view_height: u32,
-    external_decoder: bool,
     refresh_rates: *const f32,
-    refresh_rates_count: i32,
+    refresh_rates_count: u64,
     foveated_encoding: bool,
     encoder_high_profile: bool,
     encoder_10_bits: bool,
     encoder_av1: bool,
+    prefer_10bit: bool,
+    prefer_full_range: bool,
+    preferred_encoding_gamma: f32,
+    prefer_hdr: bool,
 }
 
 #[repr(u8)]
@@ -58,7 +62,9 @@ pub enum AlvrEvent {
         view_width: u32,
         view_height: u32,
         refresh_rate_hint: f32,
+        encoding_gamma: f32,
         enable_foveated_encoding: bool,
+        enable_hdr: bool,
     },
     StreamingStopped,
     Haptics {
@@ -71,7 +77,14 @@ pub enum AlvrEvent {
     DecoderConfig {
         codec: AlvrCodec,
     },
-    FrameReady,
+}
+
+#[repr(C)]
+pub struct AlvrVideoFrameData {
+    callback_context: *mut c_void,
+    timestamp_ns: u64,
+    buffer_ptr: *const u8,
+    buffer_size: u64,
 }
 
 #[repr(C)]
@@ -176,6 +189,11 @@ pub enum AlvrLogLevel {
 }
 
 #[no_mangle]
+pub extern "C" fn alvr_initialize_logging() {
+    crate::init_logging();
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn alvr_path_string_to_id(path: *const c_char) -> u64 {
     alvr_common::hash_string(CStr::from_ptr(path).to_str().unwrap())
 }
@@ -238,7 +256,7 @@ pub extern "C" fn alvr_protocol_id(protocol_buffer: *mut c_char) -> u64 {
 #[cfg(target_os = "android")]
 #[no_mangle]
 pub unsafe extern "C" fn alvr_try_get_permission(permission: *const c_char) {
-    crate::platform::try_get_permission(CStr::from_ptr(permission).to_str().unwrap());
+    alvr_system_info::try_get_permission(CStr::from_ptr(permission).to_str().unwrap());
 }
 
 /// NB: for android, `context` must be thread safe.
@@ -261,18 +279,21 @@ pub unsafe extern "C" fn alvr_initialize(capabilities: AlvrClientCapabilities) {
 
     let refresh_rates = slice::from_raw_parts(
         capabilities.refresh_rates,
-        capabilities.refresh_rates_count as _,
+        capabilities.refresh_rates_count as usize,
     )
     .to_vec();
 
     let capabilities = ClientCapabilities {
         default_view_resolution,
-        external_decoder: capabilities.external_decoder,
         refresh_rates,
         foveated_encoding: capabilities.foveated_encoding,
         encoder_high_profile: capabilities.encoder_high_profile,
         encoder_10_bits: capabilities.encoder_10_bits,
         encoder_av1: capabilities.encoder_av1,
+        prefer_10bit: capabilities.prefer_10bit,
+        prefer_full_range: capabilities.prefer_full_range,
+        preferred_encoding_gamma: capabilities.preferred_encoding_gamma,
+        prefer_hdr: capabilities.prefer_hdr,
     };
     *CLIENT_CORE_CONTEXT.lock() = Some(ClientCoreContext::new(capabilities));
 }
@@ -310,17 +331,19 @@ pub extern "C" fn alvr_poll_event(out_event: *mut AlvrEvent) -> bool {
 
                     AlvrEvent::HudMessageUpdated
                 }
-                ClientCoreEvent::StreamingStarted {
-                    settings,
-                    negotiated_config,
-                } => {
-                    *SETTINGS.lock() = serde_json::to_string(&settings).unwrap();
+                ClientCoreEvent::StreamingStarted(stream_config) => {
+                    *SETTINGS.lock() = serde_json::to_string(&stream_config.settings).unwrap();
+                    *SERVER_VERSION.lock() = stream_config.server_version.to_string();
 
                     AlvrEvent::StreamingStarted {
-                        view_width: negotiated_config.view_resolution.x,
-                        view_height: negotiated_config.view_resolution.y,
-                        refresh_rate_hint: negotiated_config.refresh_rate_hint,
-                        enable_foveated_encoding: negotiated_config.enable_foveated_encoding,
+                        view_width: stream_config.negotiated_config.view_resolution.x,
+                        view_height: stream_config.negotiated_config.view_resolution.y,
+                        refresh_rate_hint: stream_config.negotiated_config.refresh_rate_hint,
+                        encoding_gamma: stream_config.negotiated_config.encoding_gamma,
+                        enable_foveated_encoding: stream_config
+                            .negotiated_config
+                            .enable_foveated_encoding,
+                        enable_hdr: stream_config.negotiated_config.enable_hdr,
                     }
                 }
                 ClientCoreEvent::StreamingStopped => AlvrEvent::StreamingStopped,
@@ -336,9 +359,7 @@ pub extern "C" fn alvr_poll_event(out_event: *mut AlvrEvent) -> bool {
                     amplitude,
                 },
                 ClientCoreEvent::DecoderConfig { codec, config_nal } => {
-                    NAL_QUEUE
-                        .lock()
-                        .push_back((0, [ViewParams::default(); 2], config_nal));
+                    *DECODER_CONFIG_BUFFER.lock() = config_nal;
 
                     AlvrEvent::DecoderConfig {
                         codec: match codec {
@@ -347,17 +368,6 @@ pub extern "C" fn alvr_poll_event(out_event: *mut AlvrEvent) -> bool {
                             CodecType::AV1 => AlvrCodec::AV1,
                         },
                     }
-                }
-                ClientCoreEvent::FrameReady {
-                    timestamp,
-                    view_params,
-                    nal,
-                } => {
-                    NAL_QUEUE
-                        .lock()
-                        .push_back((timestamp.as_nanos() as _, view_params, nal));
-
-                    AlvrEvent::FrameReady
                 }
             };
 
@@ -369,52 +379,6 @@ pub extern "C" fn alvr_poll_event(out_event: *mut AlvrEvent) -> bool {
         }
     } else {
         false
-    }
-}
-
-/// Settings will be updated after receiving StreamingStarted event
-#[no_mangle]
-pub extern "C" fn alvr_get_settings_json(buffer: *mut c_char) -> u64 {
-    string_to_c_str(buffer, &SETTINGS.lock())
-}
-
-/// Call only with external decoder
-/// Returns the number of bytes of the next nal, or 0 if there are no nals ready.
-/// If out_nal or out_timestamp_ns is null, no nal is dequeued. Use to get the nal allocation size.
-/// Returns out_timestamp_ns == 0 if config NAL.
-#[no_mangle]
-pub extern "C" fn alvr_poll_nal(
-    out_timestamp_ns: *mut u64,
-    out_views_params: *mut AlvrViewParams,
-    out_nal: *mut c_char,
-) -> u64 {
-    let mut queue_lock = NAL_QUEUE.lock();
-    if let Some((timestamp_ns, view_params, data)) = queue_lock.pop_front() {
-        let nal_size = data.len();
-        if !out_nal.is_null() && !out_timestamp_ns.is_null() {
-            unsafe {
-                *out_timestamp_ns = timestamp_ns;
-
-                if !out_views_params.is_null() {
-                    *out_views_params = AlvrViewParams {
-                        pose: to_capi_pose(view_params[0].pose),
-                        fov: to_capi_fov(view_params[0].fov),
-                    };
-                    *out_views_params.offset(1) = AlvrViewParams {
-                        pose: to_capi_pose(view_params[1].pose),
-                        fov: to_capi_fov(view_params[1].fov),
-                    };
-                }
-
-                ptr::copy_nonoverlapping(data.as_ptr(), out_nal as _, nal_size);
-            }
-        } else {
-            queue_lock.push_front((timestamp_ns, view_params, data))
-        }
-
-        nal_size as u64
-    } else {
-        0
     }
 }
 
@@ -433,6 +397,32 @@ pub extern "C" fn alvr_hud_message(message_buffer: *mut c_char) -> u64 {
     }
 
     cstring.as_bytes_with_nul().len() as u64
+}
+
+/// Settings will be updated after receiving StreamingStarted event
+#[no_mangle]
+pub extern "C" fn alvr_get_settings_json(out_buffer: *mut c_char) -> u64 {
+    string_to_c_str(out_buffer, &SETTINGS.lock())
+}
+
+/// Will be updated after receiving StreamingStarted event
+#[no_mangle]
+pub extern "C" fn alvr_get_server_version(out_buffer: *mut c_char) -> u64 {
+    string_to_c_str(out_buffer, &SERVER_VERSION.lock())
+}
+
+/// Returns the number of bytes of the decoder_buffer
+#[no_mangle]
+pub extern "C" fn alvr_get_decoder_config(out_buffer: *mut c_char) -> u64 {
+    let buffer = DECODER_CONFIG_BUFFER.lock();
+
+    let size = buffer.len();
+
+    if !out_buffer.is_null() {
+        unsafe { ptr::copy_nonoverlapping(buffer.as_ptr(), out_buffer as _, size) }
+    }
+
+    size as u64
 }
 
 #[no_mangle]
@@ -462,7 +452,7 @@ pub extern "C" fn alvr_send_custom_interaction_profile(
     input_ids_ptr: *const u64,
     input_ids_count: u64,
 ) {
-    let input_ids = unsafe { slice::from_raw_parts(input_ids_ptr, input_ids_count as _) };
+    let input_ids = unsafe { slice::from_raw_parts(input_ids_ptr, input_ids_count as usize) };
     if let Some(context) = &*CLIENT_CORE_CONTEXT.lock() {
         context.send_custom_interaction_profile(device_id, input_ids.iter().cloned().collect());
     }
@@ -481,42 +471,47 @@ pub extern "C" fn alvr_send_button(path_id: u64, value: AlvrButtonValue) {
     }
 }
 
-/// view_params:
-/// * array of 2;
+/// The view poses need to be in local space, as if the head is at the origin.
+/// view_params: array of 2
+#[no_mangle]
+pub extern "C" fn alvr_send_view_params(view_params: *const AlvrViewParams) {
+    if let Some(context) = &*CLIENT_CORE_CONTEXT.lock() {
+        context.send_view_params(unsafe {
+            [
+                ViewParams {
+                    pose: from_capi_pose((*view_params).pose),
+                    fov: from_capi_fov((*view_params).fov),
+                },
+                ViewParams {
+                    pose: from_capi_pose((*view_params.offset(1)).pose),
+                    fov: from_capi_fov((*view_params.offset(1)).fov),
+                },
+            ]
+        });
+    }
+}
+
 /// hand_skeleton:
 /// * outer ptr: array of 2 (can be null);
 /// * inner ptr: array of 26 (can be null if hand is absent)
+///
 /// eye_gazes:
 /// * outer ptr: array of 2 (can be null);
 /// * inner ptr: pose (can be null if eye gaze is absent)
 #[no_mangle]
 pub extern "C" fn alvr_send_tracking(
-    target_timestamp_ns: u64,
-    view_params: *const AlvrViewParams,
+    poll_timestamp_ns: u64,
     device_motions: *const AlvrDeviceMotion,
     device_motions_count: u64,
     hand_skeletons: *const *const AlvrPose,
     eye_gazes: *const *const AlvrPose,
 ) {
-    let view_params = unsafe {
-        [
-            ViewParams {
-                pose: from_capi_pose((*view_params).pose),
-                fov: from_capi_fov((*view_params).fov),
-            },
-            ViewParams {
-                pose: from_capi_pose((*view_params.offset(1)).pose),
-                fov: from_capi_fov((*view_params.offset(1)).fov),
-            },
-        ]
-    };
-
     let mut raw_motions = vec![AlvrDeviceMotion::default(); device_motions_count as _];
     unsafe {
         ptr::copy_nonoverlapping(
             device_motions,
             raw_motions.as_mut_ptr(),
-            device_motions_count as _,
+            device_motions_count as usize,
         );
     }
 
@@ -587,8 +582,7 @@ pub extern "C" fn alvr_send_tracking(
 
     if let Some(context) = &*CLIENT_CORE_CONTEXT.lock() {
         context.send_tracking(
-            Duration::from_nanos(target_timestamp_ns),
-            view_params,
+            Duration::from_nanos(poll_timestamp_ns),
             device_motions,
             hand_skeletons,
             FaceData {
@@ -599,21 +593,66 @@ pub extern "C" fn alvr_send_tracking(
     }
 }
 
+/// Safety: `context` must be thread safe and valid until the StreamingStopped event.
 #[no_mangle]
-pub extern "C" fn alvr_get_head_prediction_offset_ns() -> u64 {
+pub extern "C" fn alvr_set_decoder_input_callback(
+    callback_context: *mut c_void,
+    callback: extern "C" fn(AlvrVideoFrameData) -> bool,
+) {
+    struct CallbackContext(*mut c_void);
+    unsafe impl Send for CallbackContext {}
+
+    let callback_context = CallbackContext(callback_context);
+
     if let Some(context) = &*CLIENT_CORE_CONTEXT.lock() {
-        context.get_head_prediction_offset().as_nanos() as _
-    } else {
-        0
+        context.set_decoder_input_callback(Box::new(move |timestamp, buffer| {
+            // Make sure to capture the struct itself instead of just the pointer to make the
+            // borrow checker happy
+            let callback_context = &callback_context;
+
+            callback(AlvrVideoFrameData {
+                callback_context: callback_context.0,
+                timestamp_ns: timestamp.as_nanos() as u64,
+                buffer_ptr: buffer.as_ptr(),
+                buffer_size: buffer.len() as u64,
+            })
+        }));
     }
 }
 
 #[no_mangle]
-pub extern "C" fn alvr_get_tracker_prediction_offset_ns() -> u64 {
+pub extern "C" fn alvr_report_frame_decoded(target_timestamp_ns: u64) {
     if let Some(context) = &*CLIENT_CORE_CONTEXT.lock() {
-        context.get_tracker_prediction_offset().as_nanos() as _
-    } else {
-        0
+        context.report_frame_decoded(Duration::from_nanos(target_timestamp_ns));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn alvr_report_fatal_decoder_error(message: *const c_char) {
+    if let Some(context) = &*CLIENT_CORE_CONTEXT.lock() {
+        context.report_fatal_decoder_error(unsafe { CStr::from_ptr(message).to_str().unwrap() });
+    }
+}
+
+/// out_view_params must be a vector of 2 elements
+/// out_view_params is populated only if the core context is valid
+#[no_mangle]
+pub unsafe extern "C" fn alvr_report_compositor_start(
+    target_timestamp_ns: u64,
+    out_view_params: *mut AlvrViewParams,
+) {
+    if let Some(context) = &*CLIENT_CORE_CONTEXT.lock() {
+        let view_params =
+            context.report_compositor_start(Duration::from_nanos(target_timestamp_ns));
+
+        *out_view_params = AlvrViewParams {
+            pose: to_capi_pose(view_params[0].pose),
+            fov: to_capi_fov(view_params[0].fov),
+        };
+        *out_view_params.offset(1) = AlvrViewParams {
+            pose: to_capi_pose(view_params[1].pose),
+            fov: to_capi_fov(view_params[1].fov),
+        };
     }
 }
 
@@ -624,55 +663,6 @@ pub extern "C" fn alvr_report_submit(target_timestamp_ns: u64, vsync_queue_ns: u
             Duration::from_nanos(target_timestamp_ns),
             Duration::from_nanos(vsync_queue_ns),
         );
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn alvr_request_idr() {
-    if let Some(context) = &*CLIENT_CORE_CONTEXT.lock() {
-        context.request_idr();
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn alvr_report_frame_decoded(target_timestamp_ns: u64) {
-    if let Some(context) = &*CLIENT_CORE_CONTEXT.lock() {
-        context.report_frame_decoded(Duration::from_nanos(target_timestamp_ns as _));
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn alvr_report_compositor_start(target_timestamp_ns: u64) {
-    if let Some(context) = &*CLIENT_CORE_CONTEXT.lock() {
-        context.report_compositor_start(Duration::from_nanos(target_timestamp_ns as _));
-    }
-}
-
-/// Returns frame timestamp in nanoseconds or -1 if no frame available. Returns an AHardwareBuffer
-/// from out_buffer.
-#[no_mangle]
-pub unsafe extern "C" fn alvr_get_frame(
-    view_params: *mut AlvrViewParams,
-    out_buffer: *mut *mut std::ffi::c_void,
-) -> i64 {
-    if let Some(context) = &*CLIENT_CORE_CONTEXT.lock() {
-        if let Some(decoded_frame) = context.get_frame() {
-            *view_params = AlvrViewParams {
-                pose: to_capi_pose(decoded_frame.view_params[0].pose),
-                fov: to_capi_fov(decoded_frame.view_params[0].fov),
-            };
-            *view_params.offset(1) = AlvrViewParams {
-                pose: to_capi_pose(decoded_frame.view_params[1].pose),
-                fov: to_capi_fov(decoded_frame.view_params[1].fov),
-            };
-            *out_buffer = decoded_frame.buffer_ptr as _;
-
-            decoded_frame.timestamp.as_nanos() as _
-        } else {
-            -1
-        }
-    } else {
-        -1
     }
 }
 
@@ -791,12 +781,16 @@ pub unsafe extern "C" fn alvr_start_stream_opengl(config: AlvrStreamConfig) {
         true,
         false, // TODO: limited range fix config
         1.0,   // TODO: encoding gamma config
+        None,  // TODO: passthrough config
     )));
 }
 
 // todo: support hands
 #[no_mangle]
-pub unsafe extern "C" fn alvr_render_lobby_opengl(view_inputs: *const AlvrViewInput) {
+pub unsafe extern "C" fn alvr_render_lobby_opengl(
+    view_inputs: *const AlvrViewInput,
+    render_background: bool,
+) {
     let view_inputs = [
         RenderViewInput {
             pose: from_capi_pose((*view_inputs).pose),
@@ -812,7 +806,12 @@ pub unsafe extern "C" fn alvr_render_lobby_opengl(view_inputs: *const AlvrViewIn
 
     LOBBY_RENDERER.with_borrow(|renderer| {
         if let Some(renderer) = renderer {
-            renderer.render(view_inputs, [(None, None), (None, None)]);
+            renderer.render(
+                view_inputs,
+                [(None, None), (None, None)],
+                None,
+                render_background,
+            );
         }
     });
 }
@@ -830,4 +829,141 @@ pub unsafe extern "C" fn alvr_render_stream_opengl(
             );
         }
     });
+}
+
+// Decoder-related interface
+
+static DECODER_SOURCE: OptLazy<VideoDecoderSource> = alvr_common::lazy_mut_none();
+
+#[repr(u8)]
+pub enum AlvrMediacodecPropType {
+    Float,
+    Int32,
+    Int64,
+    String,
+}
+
+#[repr(C)]
+pub union AlvrMediacodecPropValue {
+    float_: f32,
+    int32: i32,
+    int64: i64,
+    string: *const c_char,
+}
+
+#[repr(C)]
+pub struct AlvrMediacodecOption {
+    key: *const c_char,
+    ty: AlvrMediacodecPropType,
+    value: AlvrMediacodecPropValue,
+}
+
+#[repr(C)]
+pub struct AlvrDecoderConfig {
+    codec: AlvrCodec,
+    force_software_decoder: bool,
+    max_buffering_frames: f32,
+    buffering_history_weight: f32,
+    options: *const AlvrMediacodecOption,
+    options_count: u64,
+    config_buffer: *const u8,
+    config_buffer_size: u64,
+}
+
+/// alvr_initialize() must be called before alvr_create_decoder
+#[no_mangle]
+pub extern "C" fn alvr_create_decoder(config: AlvrDecoderConfig) {
+    let config = VideoDecoderConfig {
+        codec: match config.codec {
+            AlvrCodec::H264 => CodecType::H264,
+            AlvrCodec::Hevc => CodecType::Hevc,
+            AlvrCodec::AV1 => CodecType::AV1,
+        },
+        force_software_decoder: config.force_software_decoder,
+        max_buffering_frames: config.max_buffering_frames,
+        buffering_history_weight: config.buffering_history_weight,
+        options: if !config.options.is_null() {
+            let options =
+                unsafe { slice::from_raw_parts(config.options, config.options_count as usize) };
+            options
+                .iter()
+                .map(|option| unsafe {
+                    let key = CStr::from_ptr(option.key).to_str().unwrap();
+                    let prop = match option.ty {
+                        AlvrMediacodecPropType::Float => MediacodecProperty {
+                            ty: MediacodecPropType::Float,
+                            value: option.value.float_.to_string(),
+                        },
+                        AlvrMediacodecPropType::Int32 => MediacodecProperty {
+                            ty: MediacodecPropType::Int32,
+                            value: option.value.int32.to_string(),
+                        },
+                        AlvrMediacodecPropType::Int64 => MediacodecProperty {
+                            ty: MediacodecPropType::Int64,
+                            value: option.value.int64.to_string(),
+                        },
+                        AlvrMediacodecPropType::String => MediacodecProperty {
+                            ty: MediacodecPropType::String,
+                            value: CStr::from_ptr(option.value.string)
+                                .to_str()
+                                .unwrap()
+                                .to_owned(),
+                        },
+                    };
+
+                    (key.to_owned(), prop)
+                })
+                .collect()
+        } else {
+            vec![]
+        },
+        config_buffer: unsafe {
+            slice::from_raw_parts(config.config_buffer, config.config_buffer_size as usize).to_vec()
+        },
+    };
+
+    let (mut sink, source) =
+        video_decoder::create_decoder(config, |maybe_timestamp: Result<Duration>| {
+            if let Some(context) = &*CLIENT_CORE_CONTEXT.lock() {
+                match maybe_timestamp {
+                    Ok(timestamp) => context.report_frame_decoded(timestamp),
+                    Err(e) => context.report_fatal_decoder_error(&e.to_string()),
+                }
+            }
+        });
+
+    *DECODER_SOURCE.lock() = Some(source);
+
+    if let Some(context) = &*CLIENT_CORE_CONTEXT.lock() {
+        context.set_decoder_input_callback(Box::new(move |timestamp, buffer| {
+            sink.push_nal(timestamp, buffer)
+        }));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn alvr_destroy_decoder() {
+    *DECODER_SOURCE.lock() = None;
+}
+
+// Returns true if the timestamp and buffer has been written to
+#[no_mangle]
+pub extern "C" fn alvr_get_frame(
+    out_timestamp_ns: *mut u64,
+    out_buffer_ptr: *mut *mut c_void,
+) -> bool {
+    if let Some(source) = &mut *DECODER_SOURCE.lock() {
+        if let Some((timestamp, buffer_ptr)) = source.get_frame() {
+            unsafe {
+                *out_timestamp_ns = timestamp.as_nanos() as u64;
+                *out_buffer_ptr = buffer_ptr;
+            }
+
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    }
 }

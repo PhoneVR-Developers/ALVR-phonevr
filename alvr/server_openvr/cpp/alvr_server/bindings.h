@@ -27,11 +27,11 @@ struct FfiDeviceMotion {
     float angularVelocity[3];
 };
 
-struct FfiBodyTracker {
-    unsigned int trackerID;
-    FfiQuat orientation;
-    float position[3];
-    unsigned int tracking;
+struct FfiHandData {
+    const FfiDeviceMotion* controllerMotion;
+    const FfiHandSkeleton* handSkeleton;
+    bool isHandTracker;
+    bool predictHandSkeleton;
 };
 
 enum FfiOpenvrPropertyType {
@@ -145,21 +145,11 @@ extern "C" void RequestIDR();
 extern "C" void SetTracking(
     unsigned long long targetTimestampNs,
     float controllerPoseTimeOffsetS,
-    const FfiDeviceMotion* deviceMotions,
-    int motionsCount,
-<<<<<<< HEAD:alvr/server/cpp/alvr_server/bindings.h
-    const FfiHandSkeleton* leftHand,
-    const FfiHandSkeleton* rightHand,
-    unsigned int controllersTracked,
-=======
-    unsigned int controllersTracked,
-    bool useLeftHandTracker,
-    bool useRightHandTracker,
-    const FfiHandSkeleton* leftHand,
-    const FfiHandSkeleton* rightHand,
->>>>>>> upstream/master:alvr/server_openvr/cpp/alvr_server/bindings.h
-    const FfiBodyTracker* bodyTrackers,
-    int bodyTrackersCount
+    FfiDeviceMotion headMotion,
+    FfiHandData leftHandData,
+    FfiHandData rightHandData,
+    const FfiDeviceMotion* bodyTrackerMotions,
+    int bodyTrackerMotionCount
 );
 extern "C" void VideoErrorReportReceive();
 extern "C" void RequestDriverResync();

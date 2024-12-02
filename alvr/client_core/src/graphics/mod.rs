@@ -1,5 +1,4 @@
 mod lobby;
-mod opengl;
 mod staging;
 mod stream;
 
@@ -448,20 +447,6 @@ impl GraphicsContext {
                     get_native_client_buffer,
                     image_target_texture_2d,
                 )
-            })
-        };
-
-        #[cfg(all(target_os = "android", feature = "use-cpp"))]
-        unsafe {
-            opengl::initGraphicsNative();
-        }
-
-        let gl_context = unsafe {
-            gl::Context::from_loader_function(|s| {
-                instance
-                    .get_proc_address(s)
-                    .map(|f| f as *const _)
-                    .unwrap_or(std::ptr::null())
             })
         };
 

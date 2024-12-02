@@ -1,40 +1,43 @@
-<p align="center"> <img width="500" src="resources/alvr_combined_logo_hq.png"/> </p>
+<p align="center"> <img width="500" src="resources/ALVR-Grey.svg"/> </p>
 
 # ALVR - Air Light VR
 
 [![badge-discord][]][link-discord] [![badge-matrix][]][link-matrix] [![badge-opencollective][]][link-opencollective]
 
-Stream VR games from your PC to your headset via Wi-Fi.  
-ALVR uses technologies like [Asynchronous Timewarp](https://developer.oculus.com/documentation/native/android/mobile-timewarp-overview) and [Fixed Foveated Rendering](https://developer.oculus.com/documentation/native/android/mobile-ffr) for a smoother experience.  
-Most of the games that run on SteamVR or Oculus Software (using Revive) should work with ALVR.  
+Stream VR games from your PC to your headset via Wi-Fi.
 This is a fork of [ALVR](https://github.com/polygraphene/ALVR).
 
-|      VR Headset       |                                       Support                                        |
-| :-------------------: | :----------------------------------------------------------------------------------: |
-|    Quest 1/2/3/Pro    | :heavy_check_mark: ([store link](https://www.meta.com/experiences/7674846229245715)) |
-|     Pico 4/Neo 3      |                                  :heavy_check_mark:                                  |
-| Vive Focus 3/XR Elite |                                  :heavy_check_mark:                                  |
-|        YVR 1/2        |                                  :heavy_check_mark:                                  |
-|        Lynx R1        |                                  :heavy_check_mark:                                  |
-|   Apple Vision Pro    |   :heavy_check_mark: ([store link](https://apps.apple.com/app/alvr/id6479728026))    |
-|   Smartphone/Monado   |                                     :warning: *                                      |
-|   Google Cardboard    |        :warning: * ([PhoneVR](https://github.com/PhoneVR-Developers/PhoneVR))        |
-|        GearVR         |                                :construction: (maybe)                                |
-|       Oculus Go       |                                        :x: **                                        |
+### Direct download to the lastest version:
+### [Windows Launcher](https://github.com/alvr-org/ALVR/releases/latest/download/alvr_launcher_windows.zip) | [Linux Launcher](https://github.com/alvr-org/ALVR/releases/latest/download/alvr_launcher_linux.tar.gz)
 
-\* : Only works on some smartphones, not enough testing.  
+## Compatibility
+
+|      VR Headset       |                                           Support                                            |
+| :-------------------: | :------------------------------------------------------------------------------------------: |
+|  Quest 1/2/3/3S/Pro   |     :heavy_check_mark: ([store link](https://www.meta.com/experiences/7674846229245715))     |
+| Pico Neo 3/4/4 Ultra  |                                      :heavy_check_mark:                                      |
+| Vive Focus 3/XR Elite |                                      :heavy_check_mark:                                      |
+|        YVR 1/2        |                                      :heavy_check_mark:                                      |
+|        Lynx R1        |                                      :heavy_check_mark:                                      |
+|   Apple Vision Pro    |       :heavy_check_mark: ([store link](https://apps.apple.com/app/alvr/id6479728026))        |
+| PhoneVR (smartphone)  | :heavy_check_mark: * (Check [PhoneVR](https://github.com/PhoneVR-Developers/PhoneVR) Client) |
+|    Android/Monado     |                                         :warning: *                                          |
+|        GearVR         |                                    :construction: (maybe)                                    |
+|       Oculus Go       |                                            :x: **                                            |
+
+\* : Only works on some smartphones, not enough testing.
 \** : Oculus Go support was dropped, the minimum supported OS is Android 8. Download the last compatible version [here](https://github.com/alvr-org/ALVR/releases/tag/v18.2.3).
 
-|     PC OS      |        Support        |
-| :------------: | :-------------------: |
-| Windows 10/11  |  :heavy_check_mark:   |
-| Windows XP/7/8 |          :x:          |
-|     Linux      | :heavy_check_mark:*** |
-|     macOS      |          :x:          |
+|     PC OS      |                                    Support                                    |
+| :------------: | :---------------------------------------------------------------------------: |
+| Windows 10/11  | :heavy_check_mark: ([store link](https://store.steampowered.com/app/3312710)) |
+| Windows XP/7/8 |                                      :x:                                      |
+|     Linux      |                             :heavy_check_mark:***                             |
+|     macOS      |                                      :x:                                      |
 
 \*** : Please check the wiki for compatibility info
 
-## Requirements
+### Requirements
 
 -   A supported standalone VR headset (see compatibility table above)
 
@@ -45,8 +48,8 @@ This is a fork of [ALVR](https://github.com/polygraphene/ALVR).
     -   NVIDIA GPU that supports NVENC (1000 GTX Series or higher) (or with an AMD GPU that supports AMF VCE) with the latest driver.
     -   Laptops with an onboard (Intel HD, AMD iGPU) and an additional dedicated GPU (NVidia GTX/RTX, AMD HD/R5/R7): you should assign the dedicated GPU or "high performance graphics adapter" to the applications ALVR, SteamVR for best performance and compatibility. (NVidia: Nvidia control panel->3d settings->application settings; AMD: similiar way)
 
--   802.11ac 5Ghz wireless or ethernet wired connection  
-    -   It is recommended to use 802.11ac 5Ghz for the headset and ethernet for PC  
+-   802.11ac 5Ghz wireless or ethernet wired connection
+    -   It is recommended to use 802.11ac 5Ghz for the headset and ethernet for PC
     -   You need to connect both the PC and the headset to same router (or use a routed connection as described [here](https://github.com/alvr-org/ALVR/wiki/ALVR-v14-and-Above))
 
 ## Install

@@ -16,80 +16,82 @@ pub const ENCODER_DBG_LABEL: &str = "ENCODER";
 pub const DECODER_DBG_LABEL: &str = "DECODER";
 
 #[macro_export]
-macro_rules! _dbg_label {
-    ($label:expr, $($args:tt)*) => {{
-        #[cfg(debug_assertions)]
-        $crate::log::debug!("[{}] {}", $label, format_args!($($args)*));
-    }};
-}
-
-#[macro_export]
 macro_rules! dbg_server_impl {
     ($($args:tt)*) => {
-        $crate::_dbg_label!($crate::SERVER_IMPL_DBG_LABEL, $($args)*);
+        #[cfg(debug_assertions)]
+        $crate::log::debug!(target: $crate::SERVER_IMPL_DBG_LABEL, $($args)*);
     };
 }
 
 #[macro_export]
 macro_rules! dbg_client_impl {
     ($($args:tt)*) => {
-        $crate::_dbg_label!($crate::CLIENT_IMPL_DBG_LABEL, $($args)*);
+        #[cfg(debug_assertions)]
+        $crate::log::debug!(target: $crate::CLIENT_IMPL_DBG_LABEL, $($args)*);
     };
 }
 
 #[macro_export]
 macro_rules! dbg_server_core {
     ($($args:tt)*) => {
-        $crate::_dbg_label!($crate::SERVER_CORE_DBG_LABEL, $($args)*);
+        #[cfg(debug_assertions)]
+        $crate::log::debug!(target: $crate::SERVER_CORE_DBG_LABEL, $($args)*);
     };
 }
 
 #[macro_export]
 macro_rules! dbg_client_core {
     ($($args:tt)*) => {
-        $crate::_dbg_label!($crate::CLIENT_CORE_DBG_LABEL, $($args)*);
+        #[cfg(debug_assertions)]
+        $crate::log::debug!(target: $crate::CLIENT_CORE_DBG_LABEL, $($args)*);
     };
 }
 
 #[macro_export]
 macro_rules! dbg_connection {
     ($($args:tt)*) => {
-        $crate::_dbg_label!($crate::CONNECTION_DBG_LABEL, $($args)*);
+        #[cfg(debug_assertions)]
+        $crate::log::debug!(target: $crate::CONNECTION_DBG_LABEL, $($args)*);
     };
 }
 
 #[macro_export]
 macro_rules! dbg_sockets {
     ($($args:tt)*) => {
-        $crate::_dbg_label!($crate::SOCKETS_DBG_LABEL, $($args)*);
+        #[cfg(debug_assertions)]
+        $crate::log::debug!(target: $crate::SOCKETS_DBG_LABEL, $($args)*);
     };
 }
 
 #[macro_export]
 macro_rules! dbg_server_gfx {
     ($($args:tt)*) => {
-        $crate::_dbg_label!($crate::SERVER_GFX_DBG_LABEL, $($args)*);
+        #[cfg(debug_assertions)]
+        $crate::log::debug!(target: $crate::SERVER_GFX_DBG_LABEL, $($args)*);
     };
 }
 
 #[macro_export]
 macro_rules! dbg_client_gfx {
     ($($args:tt)*) => {
-        $crate::_dbg_label!($crate::CLIENT_GFX_DBG_LABEL, $($args)*);
+        #[cfg(debug_assertions)]
+        $crate::log::debug!(target: $crate::CLIENT_GFX_DBG_LABEL, $($args)*);
     };
 }
 
 #[macro_export]
 macro_rules! dbg_encoder {
     ($($args:tt)*) => {
-        $crate::_dbg_label!($crate::ENCODER_DBG_LABEL, $($args)*);
+        #[cfg(debug_assertions)]
+        $crate::log::debug!(target: $crate::ENCODER_DBG_LABEL, $($args)*);
     };
 }
 
 #[macro_export]
 macro_rules! dbg_decoder {
     ($($args:tt)*) => {
-        $crate::_dbg_label!($crate::DECODER_DBG_LABEL, $($args)*);
+        #[cfg(debug_assertions)]
+        $crate::log::debug!(target: $crate::DECODER_DBG_LABEL, $($args)*);
     };
 }
 
@@ -117,30 +119,33 @@ pub struct DebugGroupsConfig {
     pub decoder: bool,
 }
 
-pub fn filter_debug_groups(message: &str, config: &DebugGroupsConfig) -> bool {
-    if message.starts_with(&format!("[{SERVER_IMPL_DBG_LABEL}]")) {
-        config.server_impl
-    } else if message.starts_with(&format!("[{CLIENT_IMPL_DBG_LABEL}]")) {
-        config.client_impl
-    } else if message.starts_with(&format!("[{SERVER_CORE_DBG_LABEL}]")) {
-        config.server_core
-    } else if message.starts_with(&format!("[{CLIENT_CORE_DBG_LABEL}]")) {
-        config.client_core
-    } else if message.starts_with(&format!("[{CONNECTION_DBG_LABEL}]")) {
-        config.connection
-    } else if message.starts_with(&format!("[{SOCKETS_DBG_LABEL}]")) {
-        config.sockets
-    } else if message.starts_with(&format!("[{SERVER_GFX_DBG_LABEL}]")) {
-        config.server_gfx
-    } else if message.starts_with(&format!("[{CLIENT_GFX_DBG_LABEL}]")) {
-        config.client_gfx
-    } else if message.starts_with(&format!("[{ENCODER_DBG_LABEL}]")) {
-        config.encoder
-    } else if message.starts_with(&format!("[{DECODER_DBG_LABEL}]")) {
-        config.decoder
-    } else {
-        true
+pub fn filter_debug_groups(target: &str, config: &DebugGroupsConfig) -> bool {
+    match target {
+        SERVER_IMPL_DBG_LABEL => config.server_impl,
+        CLIENT_IMPL_DBG_LABEL => config.client_impl,
+        SERVER_CORE_DBG_LABEL => config.server_core,
+        CLIENT_CORE_DBG_LABEL => config.client_core,
+        CONNECTION_DBG_LABEL => config.connection,
+        SOCKETS_DBG_LABEL => config.sockets,
+        SERVER_GFX_DBG_LABEL => config.server_gfx,
+        CLIENT_GFX_DBG_LABEL => config.client_gfx,
+        ENCODER_DBG_LABEL => config.encoder,
+        DECODER_DBG_LABEL => config.decoder,
+        _ => true,
     }
+}
+
+pub fn is_enabled_debug_group(target: &str, config: &DebugGroupsConfig) -> bool {
+    (config.server_impl && target == SERVER_IMPL_DBG_LABEL)
+        || (config.client_impl && target == CLIENT_IMPL_DBG_LABEL)
+        || (config.server_core && target == SERVER_CORE_DBG_LABEL)
+        || (config.client_core && target == CLIENT_CORE_DBG_LABEL)
+        || (config.connection && target == CONNECTION_DBG_LABEL)
+        || (config.sockets && target == SOCKETS_DBG_LABEL)
+        || (config.server_gfx && target == SERVER_GFX_DBG_LABEL)
+        || (config.client_gfx && target == CLIENT_GFX_DBG_LABEL)
+        || (config.encoder && target == ENCODER_DBG_LABEL)
+        || (config.decoder && target == DECODER_DBG_LABEL)
 }
 
 #[derive(
@@ -188,7 +193,7 @@ pub fn set_panic_hook() {
 
         log::error!("ALVR panicked: {err_str}");
 
-        #[cfg(all(not(target_os = "android"), feature = "enable-messagebox"))]
+        #[cfg(not(target_os = "android"))]
         std::thread::spawn({
             let panic_str = panic_info.to_string();
             move || {
@@ -205,7 +210,7 @@ pub fn set_panic_hook() {
 pub fn show_w<W: Display + Send + 'static>(w: W) {
     log::warn!("{w}");
 
-    #[cfg(all(not(target_os = "android"), feature = "enable-messagebox"))]
+    #[cfg(not(target_os = "android"))]
     std::thread::spawn(move || {
         rfd::MessageDialog::new()
             .set_title("ALVR warning")
@@ -223,7 +228,7 @@ pub fn show_warn<T, E: Display + Send + 'static>(res: Result<T, E>) -> Option<T>
 fn show_e_block<E: Display>(e: E, blocking: bool) {
     log::error!("{e}");
 
-    #[cfg(all(not(target_os = "android"), feature = "enable-messagebox"))]
+    #[cfg(not(target_os = "android"))]
     {
         // Store the last error shown in a message box. Do not open a new message box if the content
         // of the error has not changed

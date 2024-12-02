@@ -1,9 +1,6 @@
-use std::ops::Mul;
-
 use glam::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
-
-pub use glam;
+use std::ops::Mul;
 
 // Field of view in radians
 #[derive(Serialize, Deserialize, PartialEq, Default, Debug, Clone, Copy)]
@@ -22,9 +19,10 @@ pub struct Pose {
 
 impl Pose {
     pub fn inverse(&self) -> Pose {
+        let inverse_orientation = self.orientation.conjugate();
         Pose {
-            orientation: self.orientation.conjugate(),
-            position: -self.position,
+            orientation: inverse_orientation,
+            position: inverse_orientation * -self.position,
         }
     }
 }
