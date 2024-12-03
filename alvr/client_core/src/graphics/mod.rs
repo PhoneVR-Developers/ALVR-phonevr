@@ -7,13 +7,10 @@ use std::rc::Rc;
 pub use lobby::*;
 pub use stream::*;
 
-<<<<<<< HEAD
-use alvr_common::{glam::UVec2, Fov, Pose};
-use glow::{self as gl, HasContext};
-use khronos_egl::{self as egl, EGL1_4};
-
-=======
-use alvr_common::glam::UVec2;
+use alvr_common::{
+    glam::{Mat4, UVec2, Vec4},
+    Fov,
+};
 use glow::{self as gl, HasContext};
 use khronos_egl as egl;
 use std::{ffi::c_void, mem, num::NonZeroU32, ptr};
@@ -69,136 +66,29 @@ macro_rules! ck {
 }
 pub(crate) use ck;
 
-<<<<<<< HEAD
-fn create_texture(gl: &gl::Context, resolution: UVec2, internal_format: u32) -> gl::Texture {
-    unsafe {
-        let texture = gl.create_texture().unwrap();
-        ck!(gl.bind_texture(gl::TEXTURE_2D, Some(texture)));
+fn projection_from_fov(fov: Fov) -> Mat4 {
+    const NEAR: f32 = 0.1;
 
-        ck!(gl.tex_image_2d(
-            gl::TEXTURE_2D,
-            0,
-            internal_format as i32,
-            resolution.x as i32,
-            resolution.y as i32,
-            0,
-            gl::RGBA,
-            gl::UNSIGNED_BYTE,
-            Some(&vec![255; 4 * (resolution.x * resolution.y) as usize]),
-        ));
-        ck!(gl.tex_parameter_i32(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32));
-        ck!(gl.tex_parameter_i32(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32));
-        ck!(gl.tex_parameter_i32(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32));
-        ck!(gl.tex_parameter_i32(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32));
+    let tanl = f32::tan(fov.left);
+    let tanr = f32::tan(fov.right);
+    let tanu = f32::tan(fov.up);
+    let tand = f32::tan(fov.down);
+    let a = 2.0 / (tanr - tanl);
+    let b = 2.0 / (tanu - tand);
+    let c = (tanr + tanl) / (tanr - tanl);
+    let d = (tanu + tand) / (tanu - tand);
 
-        texture
-    }
+    // note: for wgpu compatibility, the b and d components should be flipped. Maybe a bug in the
+    // viewport handling in wgpu?
+    Mat4::from_cols(
+        Vec4::new(a, 0.0, c, 0.0),
+        Vec4::new(0.0, -b, -d, 0.0),
+        Vec4::new(0.0, 0.0, -1.0, -NEAR),
+        Vec4::new(0.0, 0.0, -1.0, 0.0),
+    )
+    .transpose()
 }
 
-fn create_program(
-    gl: &gl::Context,
-    vertex_shader_source: &str,
-    fragment_shader_source: &str,
-) -> gl::Program {
-    unsafe {
-        let vertex_shader = ck!(gl.create_shader(gl::VERTEX_SHADER).unwrap());
-        ck!(gl.shader_source(vertex_shader, vertex_shader_source));
-        ck!(gl.compile_shader(vertex_shader));
-        if !gl.get_shader_compile_status(vertex_shader) {
-            panic!(
-                "Failed to compile vertex shader: {}",
-                gl.get_shader_info_log(vertex_shader)
-            );
-        }
-
-        let fragment_shader = ck!(gl.create_shader(gl::FRAGMENT_SHADER).unwrap());
-        ck!(gl.shader_source(fragment_shader, fragment_shader_source));
-        ck!(gl.compile_shader(fragment_shader));
-        if !gl.get_shader_compile_status(fragment_shader) {
-            panic!(
-                "Failed to compile fragment shader: {}",
-                gl.get_shader_info_log(fragment_shader)
-            );
-        }
-
-        let program = ck!(gl.create_program().unwrap());
-        ck!(gl.attach_shader(program, vertex_shader));
-        ck!(gl.attach_shader(program, fragment_shader));
-        ck!(gl.link_program(program));
-        if !gl.get_program_link_status(program) {
-            panic!(
-                "Failed to link program: {}",
-                gl.get_program_info_log(program)
-            );
-        }
-
-        ck!(gl.delete_shader(vertex_shader));
-        ck!(gl.delete_shader(fragment_shader));
-
-        program
-    }
-}
-
-struct RenderTarget {
-    graphics_context: Rc<GraphicsContext>,
-    framebuffer: gl::Framebuffer,
-}
-
-impl RenderTarget {
-    fn new(context: Rc<GraphicsContext>, texture: gl::Texture) -> Self {
-        let gl = &context.gl_context;
-        unsafe {
-            let framebuffer = ck!(gl.create_framebuffer().unwrap());
-            ck!(gl.bind_framebuffer(gl::DRAW_FRAMEBUFFER, Some(framebuffer)));
-            ck!(gl.framebuffer_texture_2d(
-                gl::DRAW_FRAMEBUFFER,
-                gl::COLOR_ATTACHMENT0,
-                gl::TEXTURE_2D,
-                Some(texture),
-                0,
-            ));
-            ck!(gl.bind_framebuffer(gl::FRAMEBUFFER, None));
-
-            Self {
-                graphics_context: context,
-                framebuffer,
-            }
-        }
-    }
-
-    fn bind(&self) {
-        unsafe {
-            self.graphics_context
-                .gl_context
-                .bind_framebuffer(gl::DRAW_FRAMEBUFFER, Some(self.framebuffer));
-        }
-    }
-}
-
-impl Drop for RenderTarget {
-    fn drop(&mut self) {
-        unsafe {
-            self.graphics_context
-                .gl_context
-                .delete_framebuffer(self.framebuffer);
-        }
-    }
-}
-
-pub struct RenderViewInput {
-    pub pose: Pose,
-    pub fov: Fov,
-    pub swapchain_index: u32,
-}
-
-pub struct GraphicsContext {
-    _instance: egl::DynamicInstance<EGL1_4>,
-    pub egl_display: egl::Display,
-    pub egl_config: egl::Config,
-    pub egl_context: egl::Context,
-    _dummy_surface: egl::Surface,
-    pub gl_context: gl::Context,
-=======
 pub fn choose_swapchain_format(supported_formats: &[u32], enable_hdr: bool) -> u32 {
     // Priority-sorted list of swapchain formats we'll accept--
     let mut app_supported_swapchain_formats = vec![gl::SRGB8_ALPHA8, gl::RGBA8];
