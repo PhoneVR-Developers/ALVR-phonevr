@@ -47,8 +47,12 @@ pub struct HandInteraction {
     pub controllers_profile_id: u64,
     pub grip_action: xr::Action<xr::Posef>,
     pub grip_space: xr::Space,
+
+    #[expect(dead_code)]
     pub aim_action: xr::Action<xr::Posef>,
+    #[expect(dead_code)]
     pub aim_space: xr::Space,
+
     pub vibration_action: xr::Action<xr::Haptic>,
     pub skeleton_tracker: Option<xr::HandTracker>,
 }
@@ -372,23 +376,26 @@ impl InteractionContext {
         self.body_sources.body_tracker_fb = None;
 
         // todo: check which permissions are needed for htc
-        #[cfg(target_os = "android")]
         if let Some(config) = &config.face_tracking {
             if (config.eye_tracking_fb) && matches!(self.platform, Platform::QuestPro) {
+                #[cfg(target_os = "android")]
                 alvr_system_info::try_get_permission("com.oculus.permission.EYE_TRACKING")
             }
             if config.face_tracking_fb && matches!(self.platform, Platform::QuestPro) {
-                alvr_system_info::try_get_permission("android.permission.RECORD_AUDIO");
-                alvr_system_info::try_get_permission("com.oculus.permission.FACE_TRACKING")
+                #[cfg(target_os = "android")]
+                {
+                    alvr_system_info::try_get_permission("android.permission.RECORD_AUDIO");
+                    alvr_system_info::try_get_permission("com.oculus.permission.FACE_TRACKING")
+                }
             }
         }
 
-        #[cfg(target_os = "android")]
         if let Some(config) = &config.body_tracking {
             if (config.body_tracking_fb.enabled())
                 && self.platform.is_quest()
                 && self.platform != Platform::Quest1
             {
+                #[cfg(target_os = "android")]
                 alvr_system_info::try_get_permission("com.oculus.permission.BODY_TRACKING")
             }
         }
@@ -464,14 +471,14 @@ pub fn get_reference_space(
 
 pub fn get_head_data(
     xr_session: &xr::Session<xr::OpenGlEs>,
-    reference_space: &xr::Space,
+    platform: Platform,
+    stage_reference_space: &xr::Space,
+    view_reference_space: &xr::Space,
     time: xr::Time,
     last_view_params: &[ViewParams; 2],
 ) -> Option<(DeviceMotion, Option<[ViewParams; 2]>)> {
-    let (head_location, head_velocity) = xr_session
-        .create_reference_space(xr::ReferenceSpaceType::VIEW, xr::Posef::IDENTITY)
-        .ok()?
-        .relate(reference_space, time)
+    let (head_location, head_velocity) = view_reference_space
+        .relate(stage_reference_space, time)
         .ok()?;
 
     if !head_location
@@ -485,7 +492,7 @@ pub fn get_head_data(
         .locate_views(
             xr::ViewConfigurationType::PRIMARY_STEREO,
             time,
-            reference_space,
+            stage_reference_space,
         )
         .ok()?;
 
@@ -495,7 +502,7 @@ pub fn get_head_data(
         return None;
     }
 
-    let motion = DeviceMotion {
+    let mut motion = DeviceMotion {
         pose: crate::from_xr_pose(head_location.pose),
         linear_velocity: head_velocity
             .velocity_flags
@@ -508,6 +515,12 @@ pub fn get_head_data(
             .then(|| crate::from_xr_vec3(head_velocity.angular_velocity))
             .unwrap_or_default(),
     };
+
+    // Angular velocity should be in global reference frame as per spec but Pico and Vive use local
+    // reference frame
+    if platform.is_pico() || platform.is_vive() {
+        motion.angular_velocity = motion.pose.orientation * motion.angular_velocity;
+    }
 
     let last_ipd_m = last_view_params[0]
         .pose

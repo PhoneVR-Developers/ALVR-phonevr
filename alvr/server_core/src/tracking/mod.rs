@@ -115,11 +115,7 @@ impl TrackingManager {
     }
 
     pub fn recenter_motion(&self, motion: DeviceMotion) -> DeviceMotion {
-        DeviceMotion {
-            pose: self.recenter_pose(motion.pose),
-            linear_velocity: self.inverse_recentering_origin.orientation * motion.linear_velocity,
-            angular_velocity: self.inverse_recentering_origin.orientation * motion.angular_velocity,
-        }
+        self.inverse_recentering_origin * motion
     }
 
     // Performs all kinds of tracking transformations, driven by settings.
@@ -496,13 +492,13 @@ pub fn tracking_loop(
                 let tracking_manager_lock = ctx.tracking_manager.read();
                 let device_motions = device_motion_keys
                     .iter()
-                    .filter_map(move |id| {
-                        Some((
+                    .map(move |id| {
+                        (
                             *id,
                             tracking_manager_lock
                                 .get_device_motion(*id, timestamp)
                                 .unwrap(),
-                        ))
+                        )
                     })
                     .collect::<Vec<(u64, DeviceMotion)>>();
 
@@ -525,13 +521,13 @@ pub fn tracking_loop(
                 let tracking_manager_lock = ctx.tracking_manager.read();
                 let device_motions = device_motion_keys
                     .iter()
-                    .filter_map(move |id| {
-                        Some((
+                    .map(move |id| {
+                        (
                             *id,
                             tracking_manager_lock
                                 .get_device_motion(*id, timestamp)
                                 .unwrap(),
-                        ))
+                        )
                     })
                     .collect::<Vec<_>>();
                 sink.send_tracking(&device_motions);

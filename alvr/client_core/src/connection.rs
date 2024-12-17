@@ -54,6 +54,8 @@ const STREAMING_RECV_TIMEOUT: Duration = Duration::from_millis(500);
 
 const MAX_UNREAD_PACKETS: usize = 10; // Applies per stream
 
+pub type DecoderCallback = dyn FnMut(Duration, &[u8]) -> bool + Send;
+
 #[derive(Default)]
 pub struct ConnectionContext {
     pub state: RwLock<ConnectionState>,
@@ -62,11 +64,12 @@ pub struct ConnectionContext {
     pub tracking_sender: Mutex<Option<StreamSender<Tracking>>>,
     pub statistics_sender: Mutex<Option<StreamSender<ClientStatistics>>>,
     pub statistics_manager: Mutex<Option<StatisticsManager>>,
-    pub decoder_callback: Mutex<Option<Box<dyn FnMut(Duration, &[u8]) -> bool + Send>>>,
+    pub decoder_callback: Mutex<Option<Box<DecoderCallback>>>,
     pub head_pose_queue: RwLock<VecDeque<(Duration, Pose)>>,
     pub last_good_head_pose: RwLock<Pose>,
     pub view_params: RwLock<[ViewParams; 2]>,
     pub uses_multimodal_protocol: RelaxedAtomic,
+    pub velocities_multiplier: RwLock<f32>,
 }
 
 fn set_hud_message(event_queue: &Mutex<VecDeque<ClientCoreEvent>>, message: &str) {
@@ -200,6 +203,8 @@ fn connection_pipeline(
 
     let settings = stream_config.settings;
     let negotiated_config = stream_config.negotiated_config;
+
+    *ctx.velocities_multiplier.write() = settings.extra.velocities_multiplier;
 
     *ctx.statistics_manager.lock() = Some(StatisticsManager::new(
         settings.connection.statistics_history_size,
